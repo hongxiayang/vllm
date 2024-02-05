@@ -69,7 +69,6 @@ class PagedAttention(nn.Module):
             import flash_attn
             return False
         except ImportError:
-            print("Flash attention is not available, using reference attention")
             return True
 
 
