@@ -7,6 +7,7 @@ import torch.nn as nn
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
                                          LowerTriangularMaskWithTensorBias)
+import torch.nn.functional as F
 
 from vllm._C import ops
 from vllm._C import cache_ops
@@ -14,6 +15,7 @@ from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.triton_kernel.prefix_prefill import (
     context_attention_fwd)
 from vllm.utils import is_hip
+import os
 
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
@@ -60,6 +62,7 @@ class PagedAttention(nn.Module):
                              f"Supported head sizes: {_SUPPORTED_HEAD_SIZES}.")
 
         self.use_ref_attention = self.check_use_ref_attention()
+        self.use_sdp=os.environ.get("USE_SDPA", "0")
 
     def check_use_ref_attention(self) -> bool:
         if not is_hip():
@@ -67,6 +70,39 @@ class PagedAttention(nn.Module):
         # For ROCm, check whether flash attention is installed or not.
         # if not, use_ref_attention needs to be True
         return importlib.util.find_spec("flash_attn") is None
+
+    def sdp_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        #import pdb;pdb.set_trace()
+
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+
+        # or change the shape using below unsqueeze and then squeeze in the end. THere is no difference in the output
+        
+        # query = query.unsqueeze(0).contiguous()  # no difference
+        # key = key.unsqueeze(0).contiguous()
+        # value = value.unsqueeze(0).contiguous()
+
+        #print(f"query size={query.shape}")
+        #math backend, fallback to pytorch operator
+        # it does not matter whether I do scale or not, the result is the same when is_causal=True.
+        #print("calling sdp_kernel")
+        with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+            out = F.scaled_dot_product_attention(query,key,value,
+                    #attn_mask=self.get_attn_mask(query, key),
+                    dropout_p=0.0,   
+                    scale=self.scale, # with this or not, seems not matter
+                    is_causal=True)
+            
+
+        return out #.squeeze(0)
+
 
     def ref_masked_attention(
         self,
@@ -172,15 +208,19 @@ class PagedAttention(nn.Module):
                             self.alibi_slopes, self.num_kv_heads, batch_size,
                             seq_len, query.dtype)
 
-                if self.use_ref_attention:
-                    output = self.ref_masked_attention(
-                        query,
-                        key,
-                        value,
-                    )
-                    # Using view got RuntimeError: view size is not compatible with input tensor's size and stride
-                    # (at least one dimension spans across two contiguous subspaces). Use reshape instead
+                if self.use_sdp=="1":
+                    output = self.sdp_sdpa(query, key, value)
                     return output.reshape(batch_size, seq_len, hidden_size)
+                else:
+                    if self.use_ref_attention:
+                        output = self.ref_masked_attention(
+                            query,
+                            key,
+                            value,
+                        )
+                        # Using view got RuntimeError: view size is not compatible with input tensor's size and stride
+                        # (at least one dimension spans across two contiguous subspaces). Use reshape instead
+                        return output.reshape(batch_size, seq_len, hidden_size)
 
                 # TODO(woosuk): Too many view operations. Let's try to reduce
                 # them in the future for code readability.

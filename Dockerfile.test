@@ -1,0 +1,49 @@
+
+ARG BASE_IMAGE="rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
+
+FROM $BASE_IMAGE
+
+ARG BASE_IMAGE="rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
+# ENV BASE_IMAGE_ENV=$BASE_IMAGE
+
+RUN echo "Base image is $BASE_IMAGE"
+# FROM rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1
+
+ENV BASE_IMAGE_5.7="rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1"
+ENV BASE_IMAGE_6.0="rocm/pytorch:rocm6.0_ubuntu22.04_py3.9_pytorch_2.0.1"
+
+# this does not always work for all rocm versions
+RUN LLVM_GFX_ARCH=$(/opt/rocm/llvm/bin/amdgpu-offload-arch) && \
+    echo "LLVM_GFX_ARCH is $LLVM_GFX_ARCH"
+
+
+# ENV ENV_GFX_ARCHS=gfx90a;gfx942
+
+# RUN echo "The ENV_GFX_ARCHS is $ENV_GFX_ARCHS"
+
+ARG ARG_GFX_ARCHS=$ENV_GFX_ARCHS
+
+ARG ARG_GFX_ARCHS="gfx90a;gfx942"
+RUN echo "ARG_GFX_ARCHS is $ARG_GFX_ARCHS"
+
+ARG FA_BRANCH="3d2b6f5"
+
+RUN echo "FA_BRANCH is $FA_BRANCH"
+
+RUN if [ $BASE_IMAGE = "rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1" ]; then \
+       echo "BASE_IMAGE is $BASE_IMAGE inside if TEST"; fi
+
+# Install ROCm flash-attention
+RUN mkdir libs \
+    && cd libs \
+    && export GPU_ARCHS=${ARG_GFX_ARCHS} \
+    && if [ $BASE_IMAGE = "rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1" ]; then \
+       echo "BASE_IMAGE is $BASE_IMAGE inside if"; fi \
+    && echo "AFTER IF" \
+    && cd ..
+
+# Install some basic utilities
+# RUN apt-get update && apt-get install python3 python3-pip -y
+# RUN python3 -m pip install --upgrade pip
+
+CMD ["/bin/bash"]
