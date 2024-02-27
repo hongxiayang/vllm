@@ -232,7 +232,7 @@ def with_cupy_nccl_for_all_reduce():
         global _ENABLE_CUPY_FOR_ALL_REDUCE
         old = _ENABLE_CUPY_FOR_ALL_REDUCE
         _ENABLE_CUPY_FOR_ALL_REDUCE = True
-
+        print("with_cupy_nccl_for_all_reduce")
         stream = torch.cuda.current_stream()
         with cupy_utils.set_cupy_stream(stream):
             yield

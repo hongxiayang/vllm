@@ -75,8 +75,11 @@ class PagedAttention(nn.Module):
         value: torch.Tensor,
     ) -> torch.Tensor:
         query = query.view(-1, self.num_heads, self.head_size)
-        key = key.view(-1, self.num_kv_heads, self.head_size)
-        value = value.view(-1, self.num_kv_heads, self.head_size)
+        # key = key.view(-1, self.num_kv_heads, self.head_size)
+        # value = value.view(-1, self.num_kv_heads, self.head_size)
+
+        key = key.reshape(-1, self.num_kv_heads, self.head_size)
+        value = value.reshape(-1, self.num_kv_heads, self.head_size)
 
         seq_len, _, _ = query.shape
         attn_mask = torch.triu(torch.ones(seq_len,

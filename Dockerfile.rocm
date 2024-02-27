@@ -1,9 +1,11 @@
 # default base image
-ARG BASE_IMAGE="rocm/pytorch:rocm6.0_ubuntu20.04_py3.9_pytorch_2.1.1"
+# ARG BASE_IMAGE="rocm/pytorch:rocm6.0_ubuntu20.04_py3.9_pytorch_2.1.1"
+ARG BASE_IMAGE="compute-artifactory.amd.com:5000/rocm-plus-docker/framework/compute-rocm-dkms-no-npi-hipclang:13559_ubuntu20.04_py3.9_pytorch_release-2.1_98a6632"
 
 FROM $BASE_IMAGE
 
-ARG BASE_IMAGE="rocm/pytorch:rocm6.0_ubuntu20.04_py3.9_pytorch_2.1.1"
+# ARG BASE_IMAGE="rocm/pytorch:rocm6.0_ubuntu20.04_py3.9_pytorch_2.1.1"
+ARG BASE_IMAGE="compute-artifactory.amd.com:5000/rocm-plus-docker/framework/compute-rocm-dkms-no-npi-hipclang:13559_ubuntu20.04_py3.9_pytorch_release-2.1_98a6632"
 
 RUN echo "Base image is $BASE_IMAGE"
 
@@ -22,6 +24,8 @@ RUN echo "FA_BRANCH is $FA_BRANCH"
 # this is useful for gfx target where flash-attention is not supported
 # In that case, we need to use the python reference attention implementation in vllm
 ARG BUILD_FA="1"
+
+ARG BUILD_CUPY="1"
 
 # Install some basic utilities
 RUN apt-get update && apt-get install python3 python3-pip -y
@@ -67,6 +71,22 @@ RUN if [ "$BUILD_FA" = "1" ]; then \
     && if [ "$BASE_IMAGE" = "rocm/pytorch:rocm5.7_ubuntu22.04_py3.10_pytorch_2.0.1" ]; then \
         patch /opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/utils/hipify/hipify_python.py hipify_patch.patch; fi \
     && python3 setup.py install \
+    && cd ..; \
+    fi
+
+RUN if [ "$BUILD_CUPY" = "1" ]; then \
+    mkdir -p libs \
+    && cd libs \
+    && git clone --recursive https://github.com/ROCm/cupy.git \
+    && cd cupy \
+    && pip install mpi4py-mpich \
+    && pip install scipy==1.9.3 \
+    && pip install cython==0.29.* \
+    && env CC=$MPI_HOME/bin/mpicc python -m pip install mpi4py \
+    && export CUPY_INSTALL_USE_HIP=1 \
+    && export ROCM_HOME=/opt/rocm \
+    && export HCC_AMDGPU_TARGET="gfx90a,gfx942" \
+    && pip install -e . --no-cache-dir -vvvv \
     && cd ..; \
     fi
 

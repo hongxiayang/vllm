@@ -55,6 +55,7 @@ _WORLD_SIZE = 0
 
 def is_initialized() -> bool:
     """Returns whether the NCCL backend is initialized."""
+    print(f"_NCCL_BACKEND={_NCCL_BACKEND}")
     return _NCCL_BACKEND is not None
 
 
@@ -106,8 +107,11 @@ def all_reduce(input_: torch.Tensor, op=ReduceOp.SUM) -> None:
         # cupy will fail. This will not change
         # the underlying data.
         input_ = input_.view(torch.float16)
+
     cupy_input = cupy.asarray(input_)
     cupy_input._torch_dtype = torch_dtype  # pylint: disable=protected-access
+    print(f"all_reduce {os.getpid()} calling all_reduce {_NCCL_BACKEND}")
+
     _NCCL_BACKEND.all_reduce(in_array=cupy_input,
                              out_array=cupy_input,
                              op=_OP_MAPPING[op])

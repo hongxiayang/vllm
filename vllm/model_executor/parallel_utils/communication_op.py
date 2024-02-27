@@ -34,8 +34,10 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
         return out
     if is_cupy_nccl_enabled_for_all_reduce():
         # TODO: support multiple parallel groups.
+        print("tensor_model_parallel_all_reduce NOT use torchdistributed.all_reduce using cupy_utils.all_reduce")
         cupy_utils.all_reduce(input_)
     else:
+        print("tensor_model_parallel_all_reduce use torchdistributed.all_reduce")
         torch.distributed.all_reduce(input_,
                                      group=get_tensor_model_parallel_group())
     return input_

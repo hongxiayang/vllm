@@ -86,6 +86,7 @@ def capture():
 def custom_all_reduce(input: torch.Tensor) -> Optional[torch.Tensor]:
     ca_handle = get_handle()
     # when custom allreduce is disabled, this will be None
+    print(f"custum_all_reduce {ca_handle}")
     if ca_handle is None:
         return
     if is_capturing():
@@ -146,6 +147,7 @@ class CustomAllreduce:
 
     # max_size: max supported allreduce size
     def __init__(self, rank, world_size, max_size=8192 * 1024) -> None:
+        print("CustomAllreduce init")
         # buffers memory are owned by this Python class and passed to C++
         # meta data composes of two parts: meta data for synchronization
         # (256 bytes) and a temporary buffer for storing intermediate
@@ -168,6 +170,7 @@ class CustomAllreduce:
         self.world_size = world_size
         handles, offsets = self._get_ipc_meta(self.meta)
         self.full_nvlink = _is_full_nvlink(rank, world_size)
+        self._ptr = None
         self._ptr = custom_ar.init_custom_ar(self.meta, self.rank_data,
                                              handles, offsets, rank,
                                              self.full_nvlink)

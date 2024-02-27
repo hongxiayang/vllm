@@ -1,7 +1,7 @@
 import contextlib
 import time
 from typing import Dict, List, Optional, Tuple, Set, Union
-
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,8 +30,10 @@ _PAD_SLOT_ID = -1
 LORA_WARMUP_RANK = 8
 # Capture graphs for batch size 1, 2, 4, 8, 16, 24, 32, 40, ..., 256.
 # NOTE: _get_graph_batch_size needs to be updated if this list is changed.
+#_BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
+# _BATCH_SIZES_TO_CAPTURE = [128, 256]
 
 class ModelRunner:
 
@@ -58,7 +60,7 @@ class ModelRunner:
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
         self.device = self.device_config.device
-
+        self.max_graph_batch_size_used=1
         self.model = None
         self.block_size = None  # Set after initial profiling.
         self.lora_manager = None
@@ -559,6 +561,10 @@ class ModelRunner:
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
             model_executable = self.graph_runners[graph_batch_size]
+            if graph_batch_size > self.max_graph_batch_size_used:
+                self.max_graph_batch_size_used = graph_batch_size
+            print(f"graph_batch_size = {graph_batch_size} max is {self.max_graph_batch_size_used}")
+
         else:
             model_executable = self.model
         hidden_states = model_executable(
@@ -679,7 +685,9 @@ class ModelRunner:
         input_tokens = torch.zeros(max_batch_size, 1, dtype=torch.long).cuda()
         input_positions = torch.zeros(max_batch_size, 1,
                                       dtype=torch.long).cuda()
-        slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long).cuda()
+        # slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long).cuda()
+        slot_mapping = torch.zeros(max_batch_size, 1, dtype=torch.long).cuda()
+
         slot_mapping.fill_(_PAD_SLOT_ID)
         context_lens = torch.ones(max_batch_size, dtype=torch.int32).cuda()
         block_tables = torch.from_numpy(self.graph_block_tables).cuda()
@@ -689,7 +697,7 @@ class ModelRunner:
         batch_size_capture_list = [
             bs for bs in _BATCH_SIZES_TO_CAPTURE if bs <= graph_batch_size
         ]
-
+        print(f"batch_size_capture_list={batch_size_capture_list}, pid={os.getpid()}")
         # NOTE(woosuk): There are 3 backends for all-reduce: custom all-reduce
         # kernel, CuPy NCCL, and PyTorch NCCL. When using CUDA graph, we use
         # either custom all-reduce kernel or CuPy NCCL. When not using CUDA
@@ -766,19 +774,33 @@ class CUDAGraphRunner:
         # Run the model once without capturing the graph.
         # This is to make sure that the captured graph does not include the
         # kernel launches for initial benchmarking (e.g., Triton autotune).
-        with _maybe_cupy_nccl():
-            self.model(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
-            )
-        torch.cuda.synchronize()
+        print(f"capture, {os.getpid()} before running the model once without capture")
+        # use different stream to warm up
+        # Warmup must occur on a side stream. Because the graph reads from and writes to the 
+        # same memory addresses in every replay, you must maintain long-lived references to 
+        # tensors that hold input and output data during capture. To run the graph on new input 
+        # data, copy new data to the capture’s input tensor(s), replay the graph, then read the new 
+        # output from the capture’s output tensor(s).
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            with _maybe_cupy_nccl():
+                self.model(
+                    input_ids,
+                    positions,
+                    kv_caches,
+                    input_metadata,
+                )
+        torch.cuda.current_stream().wait_stream(s)
+        # torch.cuda.synchronize()
+        print(f"capture, {os.getpid()} after running the model once without capture , start to run model with CudaGraph")
 
         # Capture the graph.
         # NOTE(woosuk): Python 3.8 does not support multi-line with statements.
         # https://stackoverflow.com/questions/31039022/python-multi-line-with-statement
         self.graph = torch.cuda.CUDAGraph()
+        # with torch.cuda.graph(self.graph):  # noqa: SIM117 no difference
         with torch.cuda.graph(self.graph, pool=memory_pool):  # noqa: SIM117
             with _maybe_cupy_nccl():
                 hidden_states = self.model(
@@ -788,7 +810,11 @@ class CUDAGraphRunner:
                     input_metadata,
                 )
         torch.cuda.synchronize()
+        print(f"capture, {os.getpid()} Finished running the model once with CudaGraph {os.getpid()}, saving hidden states")
 
+        print(f"capture, {os.getpid()} any nan {torch.isnan(input_ids).any()}, {torch.isnan(positions).any()}, {torch.isnan(input_metadata.slot_mapping).any()}, {torch.isnan(input_metadata.context_lens).any()}, {torch.isnan(input_metadata.block_tables).any()}") 
+        print(f"capture, {os.getpid()} any infinite {torch.isinf(input_ids).all()}, {torch.isinf(positions).all()}, {torch.isinf(input_metadata.slot_mapping).all()}, {torch.isinf(input_metadata.context_lens).all()}, {torch.isinf(input_metadata.block_tables).all()}") 
+        
         # Save the input and output buffers.
         self.input_buffers = {
             "input_ids": input_ids,
@@ -801,6 +827,7 @@ class CUDAGraphRunner:
         self.output_buffers = {"hidden_states": hidden_states}
         return
 
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -811,8 +838,13 @@ class CUDAGraphRunner:
         # KV caches are fixed tensors, so we don't need to copy them.
         del kv_caches
 
+        print(f"forward, {os.getpid()} before copy buffers")
+
         # Copy the input tensors to the input buffers.
+        print(f"forward, {os.getpid()} copy source device : {input_ids.device} {positions.device} {input_metadata.slot_mapping.device} {input_metadata.context_lens.device} {input_metadata.block_tables.device}")
         self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
+        print(f"forward, {os.getpid()} copy dest device : {self.input_buffers['input_ids'].device}")
+
         self.input_buffers["positions"].copy_(positions, non_blocking=True)
         self.input_buffers["slot_mapping"].copy_(input_metadata.slot_mapping,
                                                  non_blocking=True)
@@ -821,11 +853,21 @@ class CUDAGraphRunner:
         self.input_buffers["block_tables"].copy_(input_metadata.block_tables,
                                                  non_blocking=True)
 
+        print(f"forward, {os.getpid()} any nan {torch.isnan(input_ids).any()}, {torch.isnan(positions).any()}, {torch.isnan(input_metadata.slot_mapping).any()}, {torch.isnan(input_metadata.context_lens).any()}, {torch.isnan(input_metadata.block_tables).any()}") 
+        print(f"forward, {os.getpid()} any infinite {torch.isinf(input_ids).all()}, {torch.isinf(positions).all()}, {torch.isinf(input_metadata.slot_mapping).all()}, {torch.isinf(input_metadata.context_lens).all()}, {torch.isinf(input_metadata.block_tables).all()}") 
+
+
+        print(f"forward, {os.getpid()} start graph replay")
         # Run the graph.
         self.graph.replay()
+        print(f"forward, {os.getpid()} finish graph replay, return output_buffers")
 
-        # Return the output tensor.
-        return self.output_buffers["hidden_states"]
+       # Return the output tensor.
+        # import pdb;pdb.set_trace()
+        out = self.output_buffers["hidden_states"]
+        # when just doing 256, the shape of out is torch.Size([256, 1, 4096])
+        print(f"forward {os.getpid()} out isnan {torch.isnan(out).any()} isinf {torch.isinf(out).all()}")
+        return out
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -834,9 +876,11 @@ class CUDAGraphRunner:
 @contextlib.contextmanager
 def _maybe_cupy_nccl():
     if cupy_utils.is_initialized() and not custom_all_reduce.is_initialized():
+        print("_maybe_cupy_nccl IS cupy_utils.is_initialized() and not custom_all_reduce.is_initialized()")
         with with_cupy_nccl_for_all_reduce():
             yield
     else:
+        print("_maybe_cupy_nccl NOT cupy_utils.is_initialized() and not custom_all_reduce.is_initialized()")
         yield
 
 
@@ -863,7 +907,7 @@ def _get_graph_batch_size(batch_size: int) -> int:
         return 4
     else:
         return (batch_size + 7) // 8 * 8
-
+    # return 1
 
 def _async_h2d(
     data: list,
