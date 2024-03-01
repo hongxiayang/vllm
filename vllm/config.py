@@ -390,7 +390,7 @@ class ParallelConfig:
                 "Pipeline parallelism is not supported yet.")
         if not self.disable_custom_all_reduce and self.world_size > 1:
             if is_hip():
-                self.disable_custom_all_reduce = True # False
+                self.disable_custom_all_reduce = False # True
                 logger.info(
                     "Enable the custom all-reduce kernel "
                     "on AMD GPUs.")
@@ -402,10 +402,10 @@ class ParallelConfig:
 
         # FIXME(woosuk): Fix the stability issues and re-enable the custom
         # all-reduce kernel.
-        if not self.disable_custom_all_reduce and self.world_size > 1:
-            self.disable_custom_all_reduce = True  #False to enable
+        if not self.disable_custom_all_reduce and self.world_size > 1 and is_hip():
+            self.disable_custom_all_reduce = True
             logger.info(
-                "Custom all-reduce kernels are temporarily enabled due to "
+                "Custom all-reduce kernels are enabled due to "
                 "stability issues. We will re-enable them once the issues are "
                 "resolved.")
 
