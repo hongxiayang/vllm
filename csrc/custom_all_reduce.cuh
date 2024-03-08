@@ -5,20 +5,16 @@
 #include <cuda_bf16.h>
 #else
 #include <hip/amd_detail/amd_hip_bf16.h>
+#define nv_bfloat16 __hip_bfloat16
 #endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
 
 #include <iostream>
 #include <limits>
 #include <map>
 #include <unordered_map>
 #include <vector>
-
-#ifdef USE_ROCM
-#define nv_bfloat16 __hip_bfloat16
-#endif 
 
 #define CUDACHECK(cmd)                                              \
   do {                                                              \
@@ -35,29 +31,10 @@ namespace vllm {
 constexpr int kMaxBlocks = 64;
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
-
 struct Signal {
-  // alignas(64) union {
-  //   uint64_t flag;
-  //   unsigned char data[8];
-  // } start;
-  // alignas(64) union {
-  //   uint64_t flag;
-  //   unsigned char data[8];
-  // } end;
-
   alignas(128) uint32_t start[kMaxBlocks][8];
   alignas(128) uint32_t end[kMaxBlocks][8];
-
 };
-
-// struct Metadata {
-//   alignas(128) Signal sg;
-//   alignas(128) int counter;
-// };
-// static_assert(offsetof(Metadata, counter) == 128);
-// static_assert(sizeof(Metadata) == 256);
-
 
 #ifndef USE_ROCM
 struct __align__(16) RankData { const void *__restrict__ ptrs[8]; };
@@ -66,12 +43,6 @@ struct __align__(16) RankData { const void * ptrs[8]; };
 #endif
 
 struct __align__(16) RankSignals { volatile Signal *signals[8]; };
-
-// struct __align__(16) RankData { const void *__restrict__ ptrs[8]; };
-
-// struct RankSignals {
-//   volatile Signal *signals[8];
-// };
 
 // like std::array, but aligned
 template <typename T, int sz>
@@ -173,53 +144,25 @@ DINLINE O downcast(array_t<float, O::size> val) {
   }
 }
 
-// compute flag at compile time
-// __host__ __device__ constexpr uint64_t compute_flag(int ngpus) {
-//   auto m = std::numeric_limits<uint64_t>::max();
-//   return m >> ((8 - ngpus) * 8);
-// }
-
 // This function is meant to be used as the first synchronization in the all
 // reduce kernel. Thus, it doesn't need to make any visibility guarantees for
 // prior memory accesses. Note: volatile writes will not be reordered against
 // other volatile writes.
-
 template <int ngpus>
 DINLINE void start_sync(const RankSignals &sg, volatile Signal *self_sg,
                         int rank) {
-
-//   constexpr auto FLAG = compute_flag(ngpus);
-//   if (blockIdx.x == 0) {
-//     if (threadIdx.x < ngpus)
-//       // simultaneously write to the corresponding byte to all other ranks.
-//       // Latency = 1 p2p write
-// #ifndef USE_ROCM
-//       sg.signals[threadIdx.x]->start.data[rank] = 255;
-// //    else if (threadIdx.x == 32)
-// #else
-//       __atomic_store_n(&sg.signals[threadIdx.x]->start.data[rank], 255, __ATOMIC_RELEASE);
-// #endif
-//     else if (threadIdx.x == warpSize)
-
-//       // reset
-//       meta->sg.end.flag = 0;
-//       __atomic_store_n(&meta->sg.end.flag, 0, __ATOMIC_RELEASE);
-//   }
-//   if (threadIdx.x == 0) {
-// #ifndef USE_ROCM    
-//     while (meta->sg.start.flag != FLAG)
-// #else
-//     while (__atomic_load_n(&meta->sg.start.flag, __ATOMIC_ACQUIRE) != FLAG)
-// #endif
   if (threadIdx.x < ngpus) {
       // reset flag for next time
       self_sg->end[blockIdx.x][threadIdx.x] = 0;
       // simultaneously write to the corresponding flag of all ranks.
       // Latency = 1 p2p write
+#ifndef USE_ROCM
       sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
+#else
+      __atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank], 1, __ATOMIC_RELEASE);
+#endif
       // wait until we got true from all ranks
       while (!self_sg->start[blockIdx.x][threadIdx.x])
-
         ;
   }
   __syncthreads();
@@ -233,50 +176,6 @@ DINLINE void end_sync(const RankSignals &sg, volatile Signal *self_sg,
                       int rank) {
   // constexpr auto FLAG = compute_flag(ngpus);
    __syncthreads();
-//   __shared__ int num;
-//   if (threadIdx.x == 0) num = atomicAdd((int *)&meta->counter, 1);
-//   __syncthreads();
-
-//   // Only the last completing block can perform the end synchronization
-//   // This can ensures when the final busy wait ends, all ranks must have
-//   // finished reading each other's buffer.
-//   if (num == gridDim.x - 1) {
-//     if (threadIdx.x == warpSize) {
-//       // reset in a different warp
-//       meta->counter = 0;
-// #ifndef USE_ROCM
-//       meta->sg.start.flag = 0;
-// #else
-//       __atomic_store_n(&meta->sg.start.flag, 0, __ATOMIC_RELEASE);
-// #endif
-//     } else if (threadIdx.x < ngpus) {
-//       // simultaneously write to the corresponding byte to all other ranks.
-//       // Latency = 1 p2p write
-// #ifndef USE_ROCM
-//       sg.signals[threadIdx.x]->end.data[rank] = 255;
-//   #else
-//       __atomic_store_n(&sg.signals[threadIdx.x]->end.data[rank], 255, __ATOMIC_RELEASE);
-// #endif
-//     }
-//     // if this is the final sync, only one block needs it
-//     // because kernel exit can serve as sync
-//     if constexpr (final_sync) {
-//       if (threadIdx.x == 0) {
-//         while (meta->sg.end.flag != FLAG)
-//           ;
-//       }
-//     }
-//   }
-//   if constexpr (!final_sync) {
-//     if (threadIdx.x == 0) {
-// #ifndef USE_ROCM
-//       while (meta->sg.end.flag != FLAG)
-//  #else
-//         while (__atomic_load_n(&meta->sg.end.flag, __ATOMIC_ACQUIRE) != FLAG)
-// #endif
-//         ;
-//     }
-//     __syncthreads();
 // eliminate the case that prior writes are not visible after signals become
   // visible
   if constexpr (!final_sync) __threadfence_system();
@@ -285,7 +184,11 @@ DINLINE void end_sync(const RankSignals &sg, volatile Signal *self_sg,
     self_sg->start[blockIdx.x][threadIdx.x] = 0;
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
+#ifndef USE_ROCM
     sg.signals[threadIdx.x]->end[blockIdx.x][rank] = 1;
+#else
+      __atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], 1, __ATOMIC_RELEASE);
+#endif
     // wait until we got true from all ranks
     while (!self_sg->end[blockIdx.x][threadIdx.x])
       ;
@@ -586,6 +489,7 @@ class CustomAllreduce {
       } else {                                        \
         KL(ngpus, cross_device_reduce_2stage);        \
       }                                               \
+   }                                                  \
     break;                                            \
   }
 
@@ -615,7 +519,7 @@ class CustomAllreduce {
  a template instantiation:
  * template void CustomAllreduce::allreduce<half>(cudaStream_t, half *, half *,
  int, int, int);
-* template void vllm::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
+ * template void vllm::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
  half *, int, int, int);
  */
 }  // namespace vllm

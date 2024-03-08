@@ -39,7 +39,6 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
                       const std::vector<int64_t> &offsets, int rank,
                       bool full_nvlink) {
 
-
   int world_size = offsets.size();
   if (world_size > 8)
     throw std::invalid_argument("world size > 8 is not supported");
