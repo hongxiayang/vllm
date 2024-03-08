@@ -8,12 +8,16 @@ from vllm.logger import init_logger
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank)
 
+from vllm.utils import is_hip
+
 try:
     from vllm._C import custom_ar
-    import pynvml
-except ImportError:
-    # For AMD GPUs
+    if not is_hip():
+        import pynvml
+except ImportError as e:
+    print(f"custom ar import error {e}")
     custom_ar = None
+    # For AMD GPUs
     pynvml = None
 
 logger = init_logger(__name__)
@@ -111,6 +115,8 @@ def _nvml():
     try:
         pynvml.nvmlInit()
         yield
+    except Exception as e:
+        print(f"nvmlInit exception {e}")
     finally:
         pynvml.nvmlShutdown()
 
@@ -167,7 +173,11 @@ class CustomAllreduce:
         self.max_size = max_size
         self.world_size = world_size
         handles, offsets = self._get_ipc_meta(self.meta)
-        self.full_nvlink = _is_full_nvlink(rank, world_size)
+
+        # For ROCm, the full_nvlink will be detected in the kernel code
+
+        self.full_nvlink = True if is_hip() else _is_full_nvlink(rank, world_size)
+
         self._ptr = custom_ar.init_custom_ar(self.meta, self.rank_data,
                                              handles, offsets, rank,
                                              self.full_nvlink)

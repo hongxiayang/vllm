@@ -340,6 +340,9 @@ vllm_extension_sources = [
     "csrc/pybind.cpp",
 ]
 
+if _is_hip():
+    vllm_extension_sources.append("csrc/custom_all_reduce.cu")
+
 if _is_cuda():
     vllm_extension_sources.append("csrc/quantization/awq/gemm_kernels.cu")
     vllm_extension_sources.append(

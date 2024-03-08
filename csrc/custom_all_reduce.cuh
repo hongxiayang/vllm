@@ -1,15 +1,29 @@
 #pragma once
 
+// #include <cuda.h>
+// #include <cuda_bf16.h>
+// #include <cuda_fp16.h>
+// #include <cuda_runtime.h>
+
 #include <cuda.h>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
+#else
+#include <hip/amd_detail/amd_hip_bf16.h>
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
 
 #include <iostream>
 #include <limits>
 #include <map>
 #include <unordered_map>
 #include <vector>
+
+#ifdef USE_ROCM
+#define nv_bfloat16 __hip_bfloat16
+#endif 
 
 #define CUDACHECK(cmd)                                              \
   do {                                                              \
@@ -41,7 +55,14 @@ struct Metadata {
 static_assert(offsetof(Metadata, counter) == 128);
 static_assert(sizeof(Metadata) == 256);
 
+#ifndef USE_ROCM
 struct __align__(16) RankData { const void *__restrict__ ptrs[8]; };
+#else
+struct __align__(16) RankData { const void * ptrs[8]; };
+#endif
+
+
+// struct __align__(16) RankData { const void *__restrict__ ptrs[8]; };
 
 struct RankSignals {
   volatile Signal *signals[8];
@@ -86,6 +107,7 @@ DINLINE half &assign_add(half &a, half b) {
 }
 DINLINE float &assign_add(float &a, float b) { return a += b; }
 
+#ifndef USE_ROCM
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
 DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
 template <>
@@ -93,6 +115,17 @@ DINLINE nv_bfloat16 downcast_s(float val) {
   return __float2bfloat16(val);
 }
 DINLINE nv_bfloat16 &assign_add(nv_bfloat16 &a, nv_bfloat16 b) {
+  a = __hadd(a, b);
+  return a;
+}
+#endif
+#else
+DINLINE float upcast_s(__hip_bfloat16 val) { return __bfloat162float(val); }
+template <>
+DINLINE __hip_bfloat16 downcast_s(float val) {
+  return __float2bfloat16(val);
+}
+DINLINE __hip_bfloat16 &assign_add(__hip_bfloat16 &a, __hip_bfloat16 b) {
   a = __hadd(a, b);
   return a;
 }
@@ -149,13 +182,24 @@ DINLINE void start_sync(const RankSignals &sg, volatile Metadata *meta,
     if (threadIdx.x < ngpus)
       // simultaneously write to the corresponding byte to all other ranks.
       // Latency = 1 p2p write
+#ifndef USE_ROCM
       sg.signals[threadIdx.x]->start.data[rank] = 255;
-    else if (threadIdx.x == 32)
+//    else if (threadIdx.x == 32)
+#else
+      __atomic_store_n(&sg.signals[threadIdx.x]->start.data[rank], 255, __ATOMIC_RELEASE);
+#endif
+    else if (threadIdx.x == warpSize)
+
       // reset
       meta->sg.end.flag = 0;
+      __atomic_store_n(&meta->sg.end.flag, 0, __ATOMIC_RELEASE);
   }
   if (threadIdx.x == 0) {
+#ifndef USE_ROCM    
     while (meta->sg.start.flag != FLAG)
+#else
+    while (__atomic_load_n(&meta->sg.start.flag, __ATOMIC_ACQUIRE) != FLAG)
+#endif
       ;
   }
   __syncthreads();
@@ -174,14 +218,22 @@ DINLINE void end_sync(const RankSignals &sg, volatile Metadata *meta,
   // This can ensures when the final busy wait ends, all ranks must have
   // finished reading each other's buffer.
   if (num == gridDim.x - 1) {
-    if (threadIdx.x == 32) {
+    if (threadIdx.x == warpSize) {
       // reset in a different warp
       meta->counter = 0;
+#ifndef USE_ROCM
       meta->sg.start.flag = 0;
+#else
+      __atomic_store_n(&meta->sg.start.flag, 0, __ATOMIC_RELEASE);
+#endif
     } else if (threadIdx.x < ngpus) {
       // simultaneously write to the corresponding byte to all other ranks.
       // Latency = 1 p2p write
+#ifndef USE_ROCM
       sg.signals[threadIdx.x]->end.data[rank] = 255;
+  #else
+      __atomic_store_n(&sg.signals[threadIdx.x]->end.data[rank], 255, __ATOMIC_RELEASE);
+#endif
     }
     // if this is the final sync, only one block needs it
     // because kernel exit can serve as sync
@@ -194,7 +246,11 @@ DINLINE void end_sync(const RankSignals &sg, volatile Metadata *meta,
   }
   if constexpr (!final_sync) {
     if (threadIdx.x == 0) {
+#ifndef USE_ROCM
       while (meta->sg.end.flag != FLAG)
+ #else
+        while (__atomic_load_n(&meta->sg.end.flag, __ATOMIC_ACQUIRE) != FLAG)
+#endif
         ;
     }
     __syncthreads();
@@ -405,9 +461,17 @@ class CustomAllreduce {
       void *base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
+#ifndef USE_ROCM
+
       if (cuPointerGetAttribute(&base_ptr,
                                 CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
                                 (CUdeviceptr)ptr) != CUDA_SUCCESS)
+#else
+      if (cuPointerGetAttribute(&base_ptr,
+                                HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                (CUdeviceptr)ptr) != CUDA_SUCCESS)
+
+#endif
         throw std::runtime_error("failed to get pointer attr");
       CUDACHECK(cudaIpcGetMemHandle(
           (cudaIpcMemHandle_t *)&handles[i * handle_sz], base_ptr));

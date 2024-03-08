@@ -9,10 +9,32 @@
 using fptr_t = uint64_t;
 static_assert(sizeof(void *) == sizeof(fptr_t));
 
+#ifdef USE_ROCM
+#include "rocm_smi/rocm_smi.h"
+
+static bool is_full_nvlink(int rank, int world_size) {
+  for (int i = 0; i<world_size; i++) {
+    if (i == rank) {
+      continue;
+    }
+    uint64_t hops;
+    RSMI_IO_LINK_TYPE linkType;
+    rsmi_status_t status = rsmi_topo_get_link_type(	rank, i, &hops, &linkType);
+    if ( status != RSMI_STATUS_SUCCESS || hops > 1) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
+
+
 fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
                       const std::vector<std::string> &handles,
                       const std::vector<int64_t> &offsets, int rank,
                       bool full_nvlink) {
+
+
   int world_size = offsets.size();
   if (world_size > 8)
     throw std::invalid_argument("world size > 8 is not supported");
@@ -23,6 +45,10 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
         "handles length should equal to offsets length");
   if (rank < 0 || rank >= world_size)
     throw std::invalid_argument("invalid rank passed in");
+
+#ifdef USE_ROCM
+  full_nvlink = is_full_nvlink(rank, world_size);
+#endif
 
   cudaIpcMemHandle_t ipc_handles[8];
   for (int i = 0; i < world_size; i++) {
