@@ -13,6 +13,9 @@ static_assert(sizeof(void *) == sizeof(fptr_t));
 #include "rocm_smi/rocm_smi.h"
 
 static bool is_full_nvlink(int rank, int world_size) {
+  auto ret = rsmi_init(0);
+  bool full=true;
+
   for (int i = 0; i<world_size; i++) {
     if (i == rank) {
       continue;
@@ -21,10 +24,12 @@ static bool is_full_nvlink(int rank, int world_size) {
     RSMI_IO_LINK_TYPE linkType;
     rsmi_status_t status = rsmi_topo_get_link_type(	rank, i, &hops, &linkType);
     if ( status != RSMI_STATUS_SUCCESS || hops > 1) {
-      return false;
+      full = false;
+      break;
     }
   }
-  return true;
+  ret = rsmi_shut_down();
+  return full;
 }
 #endif
 
