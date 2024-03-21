@@ -106,6 +106,7 @@ RUN cd /app \
     && if [ "$BUILD_FA" = "1" ]; then \
        bash patch_xformers.rocm.sh; fi \
     && patch /opt/rocm/include/hip/amd_detail/amd_hip_bf16.h /app/vllm/rocm_patch/rocm_bf16.patch \
+    && python3 tools/amd_build/build_amd.py \
     && python3 setup.py install \
     && cd ..
 
