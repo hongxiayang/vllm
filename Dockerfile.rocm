@@ -102,11 +102,11 @@ RUN python3 -m pip install --upgrade pip
 RUN cd /app \
     && cd vllm \
     && pip install -U -r requirements-rocm.txt \
-    && patch /opt/rocm/include/hip/amd_detail/amd_hip_bf16.h /app/vllm/rocm_patch/rocm_bf16.patch \
+    # && patch /opt/rocm/include/hip/amd_detail/amd_hip_bf16.h /app/vllm/rocm_patch/rocm_bf16.patch \
     && python3 setup.py install \
     && cd ..
 
 RUN python3 -m pip install --upgrade pip
-RUN python3 -m pip install --no-cache-dir ray[all]
+RUN python3 -m pip install --no-cache-dir ray[all]==2.9.3
 
 CMD ["/bin/bash"]
