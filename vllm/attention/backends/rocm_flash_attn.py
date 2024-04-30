@@ -154,26 +154,26 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
-        self.use_naive_attn = False
+        self.use_naive_attn = True
         # NOTE: Allow for switching between Triton and CK. Defaulting to triton.
         self.use_triton_flash_attn = (os.environ.get(
-            "VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in ("true", "1"))
+            "VLLM_USE_TRITON_FLASH_ATTN", "False").lower() in ("true", "1"))
         if self.use_triton_flash_attn:
             from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
                 triton_attention)
             self.attn_func = triton_attention
             logger.debug("Using Triton FA in ROCmBackend")
         else:
-            # if not using triton, navi3x not use flash-attn either
-            if torch.cuda.get_device_capability()[0] == 11:
-                self.use_naive_attn = True
-            else:
-                try:
-                    from flash_attn import flash_attn_varlen_func  # noqa: F401
-                    self.attn_func = flash_attn_varlen_func
-                    logger.debug("Using CK FA in ROCmBackend")
-                except ModuleNotFoundError:
-                    self.use_naive_attn = True
+            # # if not using triton, navi3x not use flash-attn either
+            # if torch.cuda.get_device_capability()[0] == 11:
+            #     self.use_naive_attn = True
+            # else:
+            #     try:
+            #         from flash_attn import flash_attn_varlen_func  # noqa: F401
+            #         self.attn_func = flash_attn_varlen_func
+            #         logger.debug("Using CK FA in ROCmBackend")
+            #     except ModuleNotFoundError:
+            #         self.use_naive_attn = True
 
             if self.use_naive_attn:
                 self.attn_func = _naive_attention
@@ -186,6 +186,54 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                   None, :].expand(tokens, n_kv_heads, n_rep,
                                   head_dim).reshape(tokens, n_kv_heads * n_rep,
                                                     head_dim))
+
+
+    def _make_alibi_bias(self,
+        alibi_slopes: torch.Tensor,
+        dtype: torch.dtype,
+        prompt_lens: List[int],
+    ) -> List[torch.Tensor]:
+        attn_biases = []
+        for prompt_len in prompt_lens:
+            bias = torch.arange(prompt_len, dtype=dtype)
+            # NOTE(zhuohan): HF uses
+            #     `bias = bias[None, :].repeat(prompt_len, 1)`
+            # here. We find that both biases give the same results, but
+            # the bias below more accurately follows the original ALiBi
+            # paper.
+            bias = bias[None, :] - bias[:, None]
+
+            num_heads = alibi_slopes.shape[0]
+            bias = bias[None, :].repeat((num_heads, 1, 1))
+            bias.mul_(alibi_slopes[:, None, None])
+            inf_mask = torch.empty(
+                (1, prompt_len, prompt_len),
+                dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1)
+            attn_biases.append((bias + inf_mask).to(dtype))
+
+        return attn_biases
+
+
+    def _make_sliding_window_bias(self,
+        prompt_lens: List[int],
+        window_size: Optional[int],
+        dtype: torch.dtype,
+    ) -> List[torch.Tensor]:
+        attn_biases = []
+        for prompt_len in prompt_lens:
+            tensor = torch.full(
+                (1, prompt_len, prompt_len),
+                dtype=dtype,
+                fill_value=1,
+            )
+            shift = 0
+            mask = torch.tril(tensor, diagonal=shift).to(dtype)  # type: ignore
+            if window_size is not None:
+                mask = torch.triu(mask, diagonal=shift - window_size + 1)
+            mask = torch.log(mask)
+            attn_biases.append(mask.to(dtype))
+
+        return attn_biases
 
     def forward(
         self,
@@ -266,18 +314,50 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         True,
                         self.scale,
                     )
+                    # common code for prefill
+                    assert output[:num_prefill_tokens].shape == out.shape
+                    output[:num_prefill_tokens] = out
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
                         # Interleave for MQA workaround.
                         key = self.repeat_kv(key, self.num_queries_per_kv)
                         value = self.repeat_kv(value, self.num_queries_per_kv)
-                    out = self.attn_func(
-                        query,
-                        key,
-                        value,
-                        prefill_meta.prompt_lens,
-                        self.scale,
-                    )
+
+                    att_masks = [None] * len(prefill_meta.prompt_lens)
+                    attn_metadata.attn_bias = att_masks
+                    query = query.movedim(0, query.dim() - 2)
+                    key = key.movedim(0, key.dim() - 2)
+                    value = value.movedim(0, value.dim() - 2)
+
+                    start = 0
+                    output = torch.empty(
+                        (num_tokens, self.num_heads, self.head_size),
+                        dtype=query.dtype, device=query.device)
+                    
+                    print("use pytorch scaled_dot_product_attention now")
+                    for prompt_len, mask in zip(prefill_meta.prompt_lens,
+                                                attn_metadata.attn_bias):
+                        end = start + prompt_len
+                        with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+                            sub_out = torch.nn.functional.scaled_dot_product_attention(
+                                query[:, start:end, :],
+                                key[:, start:end, :],
+                                value[:, start:end, :],
+                                attn_mask=mask,
+                                dropout_p=0.0,
+                                is_causal= True, #not self.need_mask,
+                                scale=self.scale).movedim(query.dim() - 2, 0)
+                            output[start:end].copy_(sub_out)
+                            start = end
+
+
+                    # out = self.attn_func(
+                    #     query,
+                    #     key,
+                    #     value,
+                    #     prefill_meta.prompt_lens,
+                    #     self.scale,
+                    # )
                 else:
                     out = self.attn_func(
                         q=query,
@@ -291,9 +371,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         causal=True,
                     )
 
-                # common code for prefill
-                assert output[:num_prefill_tokens].shape == out.shape
-                output[:num_prefill_tokens] = out
+                    # common code for prefill
+                    assert output[:num_prefill_tokens].shape == out.shape
+                    output[:num_prefill_tokens] = out
             else:
                 # prefix-enabled attention
                 output[:num_prefill_tokens] = PagedAttention.forward_prefix(
