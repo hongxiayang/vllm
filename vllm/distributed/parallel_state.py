@@ -319,7 +319,31 @@ def with_pynccl_for_all_reduce():
         _ENABLE_PYNCCL_FOR_ALL_REDUCE = old
 
 
+@contextlib.contextmanager
+def with_cupy_for_all_reduce():
+    from vllm.distributed.device_communicators import cupy_utils
+    """use pynccl instead of torch.distributed for all reduce"""
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        # No-op.
+        # NOTE(woosuk): We don't initialize pynccl when tp_size is 1.
+        yield
+    else:
+        global _ENABLE_CUPY_FOR_ALL_REDUCE
+        old = _ENABLE_CUPY_FOR_ALL_REDUCE
+        _ENABLE_CUPY_FOR_ALL_REDUCE = True
+
+        stream = torch.cuda.current_stream()
+        with cupy_utils.set_cupy_stream(stream):
+            yield
+        _ENABLE_CUPY_FOR_ALL_REDUCE = old
+
 def is_pynccl_enabled_for_all_reduce():
     """check if pynccl is enabled for all reduce"""
     global _ENABLE_PYNCCL_FOR_ALL_REDUCE
     return _ENABLE_PYNCCL_FOR_ALL_REDUCE
+
+def is_cupy_enabled_for_all_reduce():
+    """check if pynccl is enabled for all reduce"""
+    global _ENABLE_CUPY_FOR_ALL_REDUCE
+    return _ENABLE_CUPY_FOR_ALL_REDUCE

@@ -12,7 +12,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
                               init_distributed_environment)
-from vllm.distributed.device_communicators import pynccl_utils
+from vllm.distributed.device_communicators import pynccl_utils, cupy_utils
 from vllm.distributed.device_communicators.custom_all_reduce import (
     init_custom_ar)
 from vllm.lora.request import LoRARequest
@@ -85,7 +85,7 @@ class Worker(WorkerBase):
         self.cache_engine: CacheEngine
         self.gpu_cache: List[torch.Tensor]
 
-    def init_device(self) -> None:
+    def init_device(self, cupy_port: Optional[int] = None) -> None:
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -108,6 +108,7 @@ class Worker(WorkerBase):
                 f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.parallel_config, self.rank,
+                                            cupy_port,
                                             self.distributed_init_method,
                                             self.local_rank)
         # Set random seed.
@@ -281,6 +282,7 @@ class Worker(WorkerBase):
 def init_worker_distributed_environment(
     parallel_config: ParallelConfig,
     rank: int,
+    cupy_port: Optional[int],
     distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
 ) -> None:
@@ -288,7 +290,15 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
 
-    if pynccl_utils.is_initialized():
+    if cupy_port and cupy_utils.is_initialized():
+        cupy_world_size = cupy_utils.get_world_size()
+        if cupy_world_size != parallel_config.world_size:
+            raise RuntimeError(
+                "cupy.distributed is already initialized but the cupy world "
+                "size does not match parallel_config.world_size "
+                f"({cupy_world_size} vs. {parallel_config.world_size}).")
+
+    elif pynccl_utils.is_initialized():
         pynccl_world_size = pynccl_utils.get_world_size()
         if pynccl_world_size != parallel_config.world_size:
             raise RuntimeError(
@@ -300,7 +310,15 @@ def init_worker_distributed_environment(
         # is 1.
         # NOTE(kaichao): By default, pynccl will use information inside
         # `parallel_state` for initialization.
-        pynccl_utils.init_process_group()
+        if cupy_port:
+            cupy_utils.init_process_group(
+                world_size=parallel_config.world_size,
+                rank=rank,
+                host="localhost",
+                port=cupy_port,
+            )
+        else:
+            pynccl_utils.init_process_group()
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
@@ -311,7 +329,9 @@ def init_worker_distributed_environment(
 
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
-    if pynccl_utils.is_initialized():
+    if cupy_port and cupy_utils.is_initialized():
+        cupy_utils.all_reduce(torch.zeros(1).cuda())
+    elif pynccl_utils.is_initialized():
         pynccl_utils.all_reduce(torch.zeros(1).cuda())
 
 

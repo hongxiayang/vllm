@@ -11,9 +11,10 @@ from vllm.attention import (AttentionMetadata, AttentionMetadataPerStage,
                             get_attn_backend)
 from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig)
-from vllm.distributed import broadcast_tensor_dict, with_pynccl_for_all_reduce
+from vllm.distributed import broadcast_tensor_dict, with_pynccl_for_all_reduce, with_cupy_for_all_reduce
 from vllm.distributed.device_communicators import (custom_all_reduce,
-                                                   pynccl_utils)
+                                                   pynccl_utils,
+                                                   cupy_utils)
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
@@ -866,7 +867,11 @@ class ModelRunner:
         """
         # NOTE(woosuk): This is a hack to ensure that the NCCL backend is never
         # deleted before the CUDA graphs.
-        self.pynccl_backend = pynccl_utils.get_nccl_backend()
+        if False:
+            self.pynccl_backend = pynccl_utils.get_nccl_backend()
+
+        if True:
+            self.cupy_backend = cupy_utils.get_nccl_backend()
 
         assert not self.model_config.enforce_eager
         logger.info("Capturing the model for CUDA graphs. This may lead to "
@@ -960,12 +965,16 @@ class ModelRunner:
         # TODO(youkaichao): when we get enough user feedback that pynccl is
         # more stable than cupy, we can remove this, e.g. in v0.4.1.
         self.graph_runners.clear()
-        self.pynccl_backend = None
+        if hasattr(self, "pynccl_backend"):
+            self.pynccl_backend = None
+        if hasattr(self, "cupy_backend"):
+            self.cupy_backend = None
 
     @property
     def vocab_size(self) -> int:
         return self.model_config.get_vocab_size()
 
+import os
 
 class CUDAGraphRunner:
 
@@ -975,6 +984,10 @@ class CUDAGraphRunner:
         self.output_buffers: Dict[str, torch.Tensor] = {}
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
+        if is_hip():
+            self.use_cupy = (os.environ.get("VLLM_USE_CUPY", "True").lower() in ("true", "1"))
+        else:
+            self.use_cupy = False
 
     @property
     def graph(self):
@@ -994,14 +1007,26 @@ class CUDAGraphRunner:
         # Run the model once without capturing the graph.
         # This is to make sure that the captured graph does not include the
         # kernel launches for initial benchmarking (e.g., Triton autotune).
-        with _maybe_pynccl():
-            self.model(
-                input_ids,
-                positions,
-                kv_caches,
-                attn_metadata,
-                **kwargs,
-            )
+        if self.use_cupy:
+            with _maybe_cupy():
+                self.model(
+                    input_ids,
+                    positions,
+                    kv_caches,
+                    attn_metadata,
+                    **kwargs,
+                )
+        else:
+            with _maybe_pynccl():
+                self.model(
+                    input_ids,
+                    positions,
+                    kv_caches,
+                    attn_metadata,
+                    **kwargs,
+                )
+
+
         torch.cuda.synchronize()
 
         # Capture the graph.
@@ -1009,14 +1034,25 @@ class CUDAGraphRunner:
         # https://stackoverflow.com/questions/31039022/python-multi-line-with-statement
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph, pool=memory_pool):  # noqa: SIM117
-            with _maybe_pynccl():
-                hidden_states = self.model(
-                    input_ids,
-                    positions,
-                    kv_caches,
-                    attn_metadata,
-                    **kwargs,
-                )
+            if self.use_cupy:
+                with _maybe_cupy():
+                    hidden_states = self.model(
+                        input_ids,
+                        positions,
+                        kv_caches,
+                        attn_metadata,
+                        **kwargs,
+                    )
+            else:
+                with _maybe_pynccl():
+                    hidden_states = self.model(
+                        input_ids,
+                        positions,
+                        kv_caches,
+                        attn_metadata,
+                        **kwargs,
+                    )
+
         torch.cuda.synchronize()
 
         # Save the input and output buffers.
@@ -1070,6 +1106,15 @@ def _maybe_pynccl():
     else:
         yield
 
+
+@contextlib.contextmanager
+def _maybe_cupy():
+    if cupy_utils.is_initialized(
+    ) and not custom_all_reduce.is_initialized():
+        with with_cupy_for_all_reduce():
+            yield
+    else:
+        yield
 
 def _get_graph_batch_size(batch_size: int) -> int:
     """Returns the padded batch size given actual batch size.

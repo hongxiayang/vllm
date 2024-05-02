@@ -123,6 +123,8 @@ class LRUCache(Generic[T]):
 def is_hip() -> bool:
     return torch.version.hip is not None
 
+def use_cupy_nccl() -> bool:
+    return (os.environ.get("VLLM_USE_CUPY_NCCL", "True").lower() in ("true", "1"))
 
 @lru_cache(maxsize=None)
 def is_cpu() -> bool:

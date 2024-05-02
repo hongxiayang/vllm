@@ -178,7 +178,13 @@ class RayGPUExecutor(DistributedGPUExecutor):
                 ))
         self._run_workers("init_worker", all_kwargs=init_worker_all_kwargs)
 
-        self._run_workers("init_device")
+        if os.environ["USE_CUPY"]:
+             self._run_workers("init_device",
+                          cupy_port=get_open_port()
+                          if not self.model_config.enforce_eager else None)
+        else:     
+            self._run_workers("init_device")
+            
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
