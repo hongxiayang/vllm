@@ -45,15 +45,43 @@ def apply_w8a8_block_fp8_linear(
 
     shape_supported_by_cutlass = (weight.shape[0] % 128 == 0
                                   and weight.shape[1] % 128 == 0)
+    if current_platform.is_rocm():
+        scale_a_shape = ((input_2d.shape[-1] // block_size[1], )
+                         + input_2d.shape[:-1])[::-1]
+        scale_b_shape = (weight_scale.view(-1, 1) if weight_scale.dim() <= 1
+                         else weight_scale.T).shape
+        ar, ac = scale_a_shape
+        br, bc = scale_b_shape
+        if (ac > 1 or bc > 1 or
+            ar not in (1, input_2d.shape[0]) or
+            br not in (1, weight.shape[0])):
+            shape_supported_by_cutlass = False
+
     if cutlass_block_fp8_supported and shape_supported_by_cutlass:
         q_input, x_scale = per_token_group_quant_fp8(input_2d,
                                                      block_size[1],
                                                      column_major_scales=True)
+
+
+        # if current_platform.is_rocm():
+        #     q_input, x_scale = ops.scaled_fp8_quant(
+        #         layer.weight, scale=None, use_per_token_if_dynamic=True)
+
+        #     print("Calling torch._scaled_mm")
+        #     import pdb;pdb.set_trace()
+        #     output = torch._scaled_mm(q_input,
+        #                               weight.T,
+        #                               out_dtype=input.dtype,
+        #                               scale_a=x_scale,
+        #                               scale_b=weight_scale.T,
+        #                               bias=bias)
+        # else:
         output = ops.cutlass_scaled_mm(q_input,
-                                       weight.T,
-                                       out_dtype=input.dtype,
-                                       scale_a=x_scale,
-                                       scale_b=weight_scale.T)
+                                    weight.T,
+                                    out_dtype=input.dtype,
+                                    scale_a=x_scale,
+                                    scale_b=weight_scale.T)
+
     else:
         q_input, x_scale = per_token_group_quant_fp8(input_2d,
                                                      block_size[1],
