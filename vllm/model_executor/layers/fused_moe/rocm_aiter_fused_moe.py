@@ -208,14 +208,6 @@ def rocm_aiter_topk_softmax_impl(topk_weights: torch.Tensor,
                  gating_output, renormalize)
 
 
-def rocm_aiter_topk_softmax_fake(topk_weights: torch.Tensor,
-                                 topk_indices: torch.Tensor,
-                                 token_expert_indices: torch.Tensor,
-                                 gating_output: torch.Tensor,
-                                 renormalize: bool) -> None:
-    pass
-
-
 if current_platform.is_rocm():
 
     direct_register_custom_op(
@@ -254,7 +246,6 @@ if current_platform.is_rocm():
         op_name="rocm_aiter_topk_softmax",
         op_func=rocm_aiter_topk_softmax_impl,
         mutates_args=["topk_weights", "topk_indices", "token_expert_indices"],
-        fake_impl=rocm_aiter_topk_softmax_fake,
         dispatch_key=current_platform.dispatch_key,
     )
 

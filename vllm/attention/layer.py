@@ -424,20 +424,9 @@ def unified_attention_with_output(
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 
-def unified_attention_with_output_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return
-
-
 direct_register_custom_op(
     op_name="unified_attention_with_output",
     op_func=unified_attention_with_output,
     mutates_args=["output"],
-    fake_impl=unified_attention_with_output_fake,
     dispatch_key=current_platform.dispatch_key,
 )
