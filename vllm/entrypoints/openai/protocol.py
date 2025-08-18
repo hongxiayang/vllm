@@ -21,6 +21,8 @@ from openai.types.responses import (ResponseInputItemParam, ResponseOutputItem,
                                     ResponsePrompt, ResponseReasoningItem,
                                     ResponseStatus)
 from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_format_text_config import (
+    ResponseFormatTextConfig)
 from openai.types.responses.response_function_tool_call import (
     ResponseFunctionToolCall)
 from openai.types.responses.tool import Tool
@@ -273,7 +275,7 @@ class ResponsesRequest(OpenAIBaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    # text: Optional[ResponseTextConfig] = None
+    text: Optional[ResponseFormatTextConfig] = None
     tool_choice: ToolChoice = "auto"
     tools: list[Tool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
@@ -1770,7 +1772,7 @@ class ResponsesResponse(OpenAIBaseModel):
     reasoning: Optional[Reasoning] = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
     status: ResponseStatus
-    # text: Optional[ResponseTextConfig] = None
+    text: Optional[ResponseFormatTextConfig] = None
     top_logprobs: int
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
@@ -1807,7 +1809,7 @@ class ResponsesResponse(OpenAIBaseModel):
             reasoning=request.reasoning,
             service_tier=request.service_tier,
             status=status,
-            # text=request.text,
+            text=request.text,
             top_logprobs=sampling_params.logprobs,
             truncation=request.truncation,
             user=request.user,
