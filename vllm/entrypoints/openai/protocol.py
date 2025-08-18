@@ -17,11 +17,12 @@ from openai.types.chat.chat_completion_audio import (
 from openai.types.chat.chat_completion_message import (
     Annotation as OpenAIAnnotation)
 # yapf: enable
-from openai.types.responses import (ResponseFunctionToolCall,
-                                    ResponseInputItemParam, ResponseOutputItem,
+from openai.types.responses import (ResponseInputItemParam, ResponseOutputItem,
                                     ResponsePrompt, ResponseReasoningItem,
-                                    ResponseStatus, ResponseTextConfig)
+                                    ResponseStatus)
 from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_function_tool_call import (
+    ResponseFunctionToolCall)
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from pydantic import (BaseModel, ConfigDict, Field, TypeAdapter,
@@ -272,7 +273,7 @@ class ResponsesRequest(OpenAIBaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    text: Optional[ResponseTextConfig] = None
+    # text: Optional[ResponseTextConfig] = None
     tool_choice: ToolChoice = "auto"
     tools: list[Tool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
@@ -1769,7 +1770,7 @@ class ResponsesResponse(OpenAIBaseModel):
     reasoning: Optional[Reasoning] = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
     status: ResponseStatus
-    text: Optional[ResponseTextConfig] = None
+    # text: Optional[ResponseTextConfig] = None
     top_logprobs: int
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
@@ -1806,7 +1807,7 @@ class ResponsesResponse(OpenAIBaseModel):
             reasoning=request.reasoning,
             service_tier=request.service_tier,
             status=status,
-            text=request.text,
+            # text=request.text,
             top_logprobs=sampling_params.logprobs,
             truncation=request.truncation,
             user=request.user,
