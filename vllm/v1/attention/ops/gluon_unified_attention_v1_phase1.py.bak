@@ -1,0 +1,404 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Gluon-based unified attention kernel for AMD CDNA3/CDNA4 (gfx9xx).
+
+Supports the causal-paged-attention common case: bf16/fp16, GQA,
+sliding window, no FP8/alibi/softcap/sinks/qq_bias/mm_prefix. For
+unsupported features, the backend wrapper falls back to the existing
+Triton unified_attention kernel.
+
+The kernel uses explicit ``gl.amd.cdna3.mfma`` for both Q·K^T and P·V
+matmuls and relies on Gluon's automatic layout conversions between a
+single BLOCKED working layout and MFMA dot-operand layouts.
+"""
+
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+
+
+@gluon.jit
+def _find_seq_idx(query_start_len_ptr, target_idx, num_seqs, BLOCK_Q: gl.constexpr):
+    left: gl.int32 = 0
+    right = num_seqs
+    while left < right:
+        mid = (left + right) // 2
+        val = gl.load(query_start_len_ptr + mid)
+        mid_val = val // BLOCK_Q + mid
+        if mid_val <= target_idx:
+            left = mid + 1
+        else:
+            right = mid
+    return left - 1
+
+
+@gluon.jit
+def kernel_gluon_unified_attention_2d(
+    output_ptr,          # [num_tokens, num_query_heads, head_size]
+    query_ptr,           # [num_tokens, num_query_heads, head_size]
+    key_cache_ptr,       # [num_blocks, block_size, num_kv_heads, head_size]
+    value_cache_ptr,     # [num_blocks, block_size, num_kv_heads, head_size]
+    block_tables_ptr,    # [num_seqs, max_num_blocks_per_seq]
+    seq_lens_ptr,        # [num_seqs]
+    query_start_len_ptr, # [num_seqs + 1]
+    scale,
+    num_query_heads: gl.constexpr,
+    num_queries_per_kv: gl.constexpr,
+    block_table_stride: gl.int64,
+    query_stride_0: gl.int64,
+    query_stride_1: gl.int64,
+    output_stride_0: gl.int64,
+    output_stride_1: gl.int64,
+    stride_k_cache_0: gl.int64,
+    stride_k_cache_1: gl.int64,
+    stride_k_cache_2: gl.int64,
+    stride_k_cache_3: gl.constexpr,
+    stride_v_cache_0: gl.int64,
+    stride_v_cache_1: gl.int64,
+    stride_v_cache_2: gl.int64,
+    stride_v_cache_3: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    HEAD_SIZE_PADDED: gl.constexpr,
+    BLOCK_Q: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+    num_seqs: gl.int32,
+):
+    q_block_global_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+
+    seq_idx = _find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q
+    )
+    q_block_start_idx = gl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_query_len = (
+        cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+    )
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    # ---- MFMA accumulator layout (shared by S and acc). ----
+    # instr_shape=[16, 16, 32] supports bf16/fp16 on CDNA3/CDNA4.
+    mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+
+    # Single working layout for Q/K/V loads. Gluon will insert
+    # convert_layouts into DotOperand form before each mfma.
+    workLayoutQ: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[16, 4],
+        warps_per_cta=[1, 1],
+        order=[1, 0],
+    )
+    workLayoutS: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[16, 4],
+        warps_per_cta=[1, 1],
+        order=[1, 0],
+    )
+
+    # Offsets in workLayoutQ (for Q, acc, output stores).
+    offs_m_q = gl.arange(0, BLOCK_M, gl.SliceLayout(1, workLayoutQ))
+    offs_d_q = gl.arange(0, HEAD_SIZE_PADDED, gl.SliceLayout(0, workLayoutQ))
+    # Offsets in workLayoutS (for S tile, masks, softmax updates).
+    offs_m_s = gl.arange(0, BLOCK_M, gl.SliceLayout(1, workLayoutS))
+    offs_t_s = gl.arange(0, TILE_SIZE, gl.SliceLayout(0, workLayoutS))
+
+    query_pos_q = q_block_local_idx * BLOCK_Q + offs_m_q // num_queries_per_kv
+    query_offset_0_q = cur_batch_in_all_start_index + query_pos_q
+    query_offset_1_q = (
+        kv_head_idx * num_queries_per_kv + offs_m_q % num_queries_per_kv
+    )
+    query_offset = (
+        query_offset_0_q[:, None] * query_stride_0
+        + query_offset_1_q[:, None] * query_stride_1
+        + offs_d_q[None, :]
+    )
+
+    dim_mask_q = offs_d_q < HEAD_SIZE
+    query_mask_0_q = query_pos_q < cur_batch_query_len
+    query_mask_1_q = query_offset_1_q < num_query_heads
+
+    Q = gl.load(
+        query_ptr + query_offset,
+        mask=(
+            dim_mask_q[None, :]
+            & query_mask_0_q[:, None]
+            & query_mask_1_q[:, None]
+        ),
+        other=0.0,
+    )
+
+    # S-layout mirror of the above offsets / masks (for causal mask, etc.)
+    query_pos_s = q_block_local_idx * BLOCK_Q + offs_m_s // num_queries_per_kv
+    query_offset_1_s = (
+        kv_head_idx * num_queries_per_kv + offs_m_s % num_queries_per_kv
+    )
+    query_mask_0_s = query_pos_s < cur_batch_query_len
+    query_mask_1_s = query_offset_1_s < num_query_heads
+
+    block_table_offset = seq_idx * block_table_stride
+
+    # Use workLayoutS slice (row-reduction axis) for online softmax state.
+    M = gl.full(
+        [BLOCK_M], float("-inf"), gl.float32,
+        layout=gl.SliceLayout(1, workLayoutS),
+    )
+    L = gl.full(
+        [BLOCK_M], 1.0, gl.float32,
+        layout=gl.SliceLayout(1, workLayoutS),
+    )
+    acc = gl.zeros(
+        [BLOCK_M, HEAD_SIZE_PADDED], gl.float32, workLayoutQ,
+    )
+
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    context_len = seq_len - cur_batch_query_len
+
+    max_seq_prefix_len = (
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1
+    )
+    max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
+    num_tiles = (max_seq_prefix_len + TILE_SIZE - 1) // TILE_SIZE
+
+    tile_start = 0
+    tile_end = num_tiles
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = gl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed = context_len + qpos_hi
+        tile_start = gl.maximum(0, first_allowed // TILE_SIZE)
+        tile_end = gl.minimum((last_allowed // TILE_SIZE) + 1, num_tiles)
+
+    for j in range(tile_start, tile_end):
+        seq_offset_s = j * TILE_SIZE + offs_t_s
+        tile_mask_s = seq_offset_s < max_seq_prefix_len
+
+        # K load in workLayoutS-compatible axes (HEAD x TILE).
+        # We load K into workLayoutQ's "column-major" cousin by flipping axes
+        # via offsets. Simpler: load K as [TILE, HEAD] and transpose via mfma
+        # operand layout later — but gluon mfma expects [M,K] x [K,N]. To keep
+        # it simple, we load K as [HEAD, TILE] in a dedicated layout.
+        k_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[8, 1],
+            threads_per_warp=[8, 8],
+            warps_per_cta=[1, 1],
+            order=[0, 1],
+        )
+        offs_d_k = gl.arange(0, HEAD_SIZE_PADDED, gl.SliceLayout(1, k_layout))
+        offs_t_k = gl.arange(0, TILE_SIZE, gl.SliceLayout(0, k_layout))
+        seq_offset_k = j * TILE_SIZE + offs_t_k
+        tile_mask_k = seq_offset_k < max_seq_prefix_len
+        physical_block_idx_k = gl.load(
+            block_tables_ptr
+            + block_table_offset
+            + seq_offset_k // BLOCK_SIZE
+        ).to(gl.int64)
+        k_offset = (
+            physical_block_idx_k[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_d_k[:, None] * stride_k_cache_3
+            + (seq_offset_k % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
+        K = gl.load(
+            key_cache_ptr + k_offset,
+            mask=(offs_d_k < HEAD_SIZE)[:, None] & tile_mask_k[None, :],
+            other=0.0,
+        )
+
+        # V load as [TILE, HEAD] in workLayoutQ-style.
+        v_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[16, 4],
+            warps_per_cta=[1, 1],
+            order=[1, 0],
+        )
+        offs_t_v = gl.arange(0, TILE_SIZE, gl.SliceLayout(1, v_layout))
+        offs_d_v = gl.arange(0, HEAD_SIZE_PADDED, gl.SliceLayout(0, v_layout))
+        seq_offset_v = j * TILE_SIZE + offs_t_v
+        tile_mask_v = seq_offset_v < max_seq_prefix_len
+        physical_block_idx_v = gl.load(
+            block_tables_ptr
+            + block_table_offset
+            + seq_offset_v // BLOCK_SIZE
+        ).to(gl.int64)
+        v_offset = (
+            physical_block_idx_v[:, None] * stride_v_cache_0
+            + kv_head_idx * stride_v_cache_2
+            + offs_d_v[None, :] * stride_v_cache_3
+            + (seq_offset_v % BLOCK_SIZE)[:, None] * stride_v_cache_1
+        )
+        V = gl.load(
+            value_cache_ptr + v_offset,
+            mask=tile_mask_v[:, None] & (offs_d_v < HEAD_SIZE)[None, :],
+            other=0.0,
+        )
+
+        # --- Q · K^T via MFMA ---
+        dotOpA: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=mfmaLayout, k_width=8,
+        )
+        dotOpB: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=mfmaLayout, k_width=8,
+        )
+        Q_mfma = gl.convert_layout(Q, layout=dotOpA)
+        K_mfma = gl.convert_layout(K, layout=dotOpB)
+        S_acc = gl.zeros([BLOCK_M, TILE_SIZE], gl.float32, mfmaLayout)
+        S_acc = gl.amd.cdna4.mfma(Q_mfma, K_mfma, S_acc)
+        S = gl.convert_layout(S_acc, layout=workLayoutS) * scale
+
+        # Causal / sliding-window mask in workLayoutS.
+        query_abs_pos_s = context_len + query_pos_s[:, None]
+        seq_mask = seq_offset_s[None, :] <= query_abs_pos_s
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & (
+                (query_abs_pos_s - seq_offset_s[None, :]) < SLIDING_WINDOW
+            )
+        S = gl.where(
+            seq_mask & query_mask_1_s[:, None] & query_mask_0_s[:, None],
+            S,
+            float("-inf"),
+        )
+
+        # --- Online softmax update (workLayoutS) ---
+        m_j = gl.maximum(M, gl.max(S, axis=1))
+        m_j = gl.where(m_j > float("-inf"), m_j, 0.0)
+        P = gl.exp(S - m_j[:, None])
+        l_j = gl.sum(P, axis=1)
+        alpha = gl.exp(M - m_j)
+        L = L * alpha + l_j
+        M = m_j
+
+        # Scale prior accumulator (workLayoutQ) by alpha. Need to convert
+        # alpha from SliceLayout(1, workLayoutS) to SliceLayout(1, workLayoutQ).
+        alpha_q = gl.convert_layout(alpha, layout=gl.SliceLayout(1, workLayoutQ))
+        acc = acc * alpha_q[:, None]
+
+        # --- P · V via MFMA ---
+        P_mfma = gl.convert_layout(P.to(V.dtype), layout=dotOpA)
+        V_mfma = gl.convert_layout(V, layout=dotOpB)
+        acc_mfma = gl.convert_layout(acc, layout=mfmaLayout)
+        acc_mfma = gl.amd.cdna4.mfma(P_mfma, V_mfma, acc_mfma)
+        acc = gl.convert_layout(acc_mfma, layout=workLayoutQ)
+
+    L_q = gl.convert_layout(L, layout=gl.SliceLayout(1, workLayoutQ))
+    acc = acc / L_q[:, None]
+
+    output_offset = (
+        query_offset_0_q[:, None] * output_stride_0
+        + query_offset_1_q[:, None] * output_stride_1
+        + offs_d_q[None, :]
+    )
+    gl.store(
+        output_ptr + output_offset,
+        acc.to(query_ptr.dtype.element_ty),
+        mask=(
+            dim_mask_q[None, :]
+            & query_mask_0_q[:, None]
+            & query_mask_1_q[:, None]
+        ),
+    )
+
+
+def _select_tile_size(head_size: int, is_prefill: bool) -> int:
+    # Keep LDS within 160KB on gfx950 for head_size up to 512.
+    if head_size >= 256:
+        return 32
+    return 64 if is_prefill else 32
+
+
+def gluon_unified_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size,
+    block_table: torch.Tensor,
+):
+    """Entry point for the GLUON_ATTN backend."""
+    assert causal, "GLUON_ATTN supports causal attention only"
+    assert q.dtype in (torch.bfloat16, torch.float16), (
+        "GLUON_ATTN supports bf16/fp16 Q only"
+    )
+
+    block_size = v.shape[1]
+    num_seqs = len(seqused_k)
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_size = q.shape[2]
+
+    BLOCK_M = (
+        16
+        if num_queries_per_kv <= 16
+        else triton.next_power_of_2(num_queries_per_kv)
+    )
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+    is_prefill = max_seqlen_q > 1
+    TILE_SIZE = _select_tile_size(head_size, is_prefill)
+
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    sliding_window = 1 + window_size[0] if window_size[0] >= 0 else 0
+
+    kernel_gluon_unified_attention_2d[
+        (total_num_q_blocks, num_kv_heads)
+    ](
+        output_ptr=out,
+        query_ptr=q,
+        key_cache_ptr=k,
+        value_cache_ptr=v,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seqused_k,
+        query_start_len_ptr=cu_seqlens_q,
+        scale=softmax_scale,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        block_table_stride=block_table.stride(0),
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        stride_k_cache_0=k.stride(0),
+        stride_k_cache_1=k.stride(1),
+        stride_k_cache_2=k.stride(2),
+        stride_k_cache_3=k.stride(3),
+        stride_v_cache_0=v.stride(0),
+        stride_v_cache_1=v.stride(1),
+        stride_v_cache_2=v.stride(2),
+        stride_v_cache_3=v.stride(3),
+        BLOCK_SIZE=block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_M=BLOCK_M,
+        SLIDING_WINDOW=sliding_window,
+        num_seqs=num_seqs,
+        num_warps=1,
+    )
