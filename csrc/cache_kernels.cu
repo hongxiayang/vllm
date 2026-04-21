@@ -138,19 +138,17 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
   }
 #elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
   // ROCm 7.1+ exposes hipMemcpyBatchAsync. The 7.2.1 implementation early-
-  // returns hipErrorNotSupported whenever numAttrs > 0 (see
-  // ROCm/clr @ rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so pass
-  // numAttrs=0 / attrs=nullptr. Internally the runtime still issues a per-
-  // op ihipMemcpy loop, so this is roughly on par with the fallback below
-  // but keeps submission in C++ and auto-upgrades when AMD wires real
-  // batching.
+  // returns hipErrorNotSupported whenever numAttrs > 0 (see ROCm/clr @
+  // rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so call with
+  // numAttrs=0.
   {
+    hipMemcpyAttributes attr = {};
+    size_t attrs_idx = 0;
     size_t fail_idx = 0;
     hipError_t result = hipMemcpyBatchAsync(
         reinterpret_cast<void**>(dst_data), reinterpret_cast<void**>(src_data),
         reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n),
-        /*attrs=*/nullptr, /*attrsIdxs=*/nullptr, /*numAttrs=*/0,
-        &fail_idx, static_cast<hipStream_t>(stream));
+        &attr, &attrs_idx, 0, &fail_idx, static_cast<hipStream_t>(stream));
     TORCH_CHECK(result == hipSuccess, "hipMemcpyBatchAsync failed at index ",
                 fail_idx, " with error ", result);
     return;

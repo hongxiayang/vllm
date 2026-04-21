@@ -37,7 +37,6 @@ def _make_llm(model: str, lazy: bool, cpu_bytes_to_use: int) -> LLM:
     )
     return LLM(
         model=model,
-        gpu_memory_utilization=0.7,
         kv_cache_memory_bytes=40 << 30,  # 40 GiB
         disable_hybrid_kv_cache_manager=False,
         enable_prefix_caching=True,

@@ -168,32 +168,22 @@ def copy_blocks(
     sz_all = np.repeat(params.bpb, n)
     total = n * params.num_layers
 
-    if current_platform.is_rocm():
-        # ROCm 7.1+: numAttrs must be 0 (the runtime rejects attrs).
-        err = _batch_memcpy_fn(
-            dst_all.ctypes.data,
-            src_all.ctypes.data,
-            sz_all.ctypes.data,
-            total,
-            None,  # attrs
-            None,  # attrsIdxs
-            0,     # numAttrs
-            ctypes.byref(params.fail_idx),
-            params.stream_handle,
-        )
-    else:
-        err = _batch_memcpy_fn(
-            dst_all.ctypes.data,
-            src_all.ctypes.data,
-            sz_all.ctypes.data,
-            total,
-            ctypes.addressof(params.attrs),
-            ctypes.byref(params.attrs_idx),
-            1,
-            ctypes.byref(params.fail_idx),
-            params.stream_handle,
-        )
-
+    # ROCm 7.2.1 rejects any call with numAttrs>0 (hipMemcpyBatchAsync
+    # hipamd/src/hip_memory.cpp:2819-2822); CUDA uses one attrs entry so
+    # srcAccessOrder is honored. attrs / attrsIdxs pointers are ignored
+    # when numAttrs==0, so we pass the same values from both paths.
+    num_attrs = 0 if current_platform.is_rocm() else 1
+    err = _batch_memcpy_fn(
+        dst_all.ctypes.data,
+        src_all.ctypes.data,
+        sz_all.ctypes.data,
+        total,
+        ctypes.addressof(params.attrs),
+        ctypes.byref(params.attrs_idx),
+        num_attrs,
+        ctypes.byref(params.fail_idx),
+        params.stream_handle,
+    )
     if err != 0:
         raise RuntimeError(
             f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
