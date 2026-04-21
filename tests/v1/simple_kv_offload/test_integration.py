@@ -10,8 +10,8 @@ from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.config import KVTransferConfig
 from vllm.platforms import current_platform
 
-if not current_platform.is_cuda():
-    pytest.skip("Requires CUDA", allow_module_level=True)
+if not current_platform.is_cuda_alike():
+    pytest.skip("Requires CUDA or ROCm", allow_module_level=True)
 
 # Small models for default CI / local runs (accuracy only).
 SMALL_MODELS = [
@@ -37,6 +37,7 @@ def _make_llm(model: str, lazy: bool, cpu_bytes_to_use: int) -> LLM:
     )
     return LLM(
         model=model,
+        gpu_memory_utilization=0.7,
         kv_cache_memory_bytes=40 << 30,  # 40 GiB
         disable_hybrid_kv_cache_manager=False,
         enable_prefix_caching=True,
