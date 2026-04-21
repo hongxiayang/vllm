@@ -66,11 +66,21 @@ def _resolve_batch_memcpy():
     * ROCm: ``hipMemcpyBatchAsync`` from libamdhip64 (ROCm 7.1+). ROCm
       7.2.1 rejects any call with ``numAttrs > 0``
       (see ROCm/clr @ rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so
-      we call with ``numAttrs=0`` / ``attrs=nullptr``.
+      we call with ``numAttrs=0``.
+
+    Raises ``RuntimeError`` if the symbol is unavailable (older CUDA
+    driver, ROCm < 7.1, unusual install). The connector requires the
+    batch API.
     """
     if current_platform.is_rocm():
-        lib = ctypes.CDLL("libamdhip64.so", mode=ctypes.RTLD_GLOBAL)
-        fn = lib.hipMemcpyBatchAsync
+        try:
+            lib = ctypes.CDLL("libamdhip64.so", mode=ctypes.RTLD_GLOBAL)
+            fn = lib.hipMemcpyBatchAsync
+        except (OSError, AttributeError) as e:
+            raise RuntimeError(
+                "hipMemcpyBatchAsync is unavailable in this ROCm install; "
+                "SimpleCPUOffloadConnector requires ROCm 7.1+."
+            ) from e
         fn.restype = ctypes.c_uint
         fn.argtypes = [
             ctypes.c_void_p,  # dsts
@@ -170,8 +180,8 @@ def copy_blocks(
 
     # ROCm 7.2.1 rejects any call with numAttrs>0 (hipMemcpyBatchAsync
     # hipamd/src/hip_memory.cpp:2819-2822); CUDA uses one attrs entry so
-    # srcAccessOrder is honored. attrs / attrsIdxs pointers are ignored
-    # when numAttrs==0, so we pass the same values from both paths.
+    # srcAccessOrder is honored. attrs / attrsIdxs are ignored when
+    # numAttrs==0, so we pass the same values from both paths.
     num_attrs = 0 if current_platform.is_rocm() else 1
     err = _batch_memcpy_fn(
         dst_all.ctypes.data,
