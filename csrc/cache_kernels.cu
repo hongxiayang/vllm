@@ -18,7 +18,6 @@
 #endif
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cfloat>
 
@@ -138,34 +137,29 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     return;
   }
 #elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
-  // HIP 7.1+ exposes hipMemcpyBatchAsync with the same signature. ROCm 7.2
-  // ships the symbol as a stub that returns hipErrorNotSupported; detect
-  // that at call time, clear the sticky last error (otherwise subsequent
-  // torch ops surface the stale NotSupported), and fall through to the
-  // per-op loop for the remainder of this process. This auto-activates
-  // when a future ROCm release wires the real implementation.
-  static std::atomic<bool> batch_supported{true};
-  if (batch_supported.load(std::memory_order_relaxed)) {
-    hipMemcpyAttributes attr = {};
-    attr.srcAccessOrder = hipMemcpySrcAccessOrderStream;
-    size_t attrs_idx = 0;
+  // ROCm 7.1+ exposes hipMemcpyBatchAsync. The 7.2.1 implementation early-
+  // returns hipErrorNotSupported whenever numAttrs > 0 (see
+  // ROCm/clr @ rocm-7.2.1 hipamd/src/hip_memory.cpp:2819-2822), so pass
+  // numAttrs=0 / attrs=nullptr. Internally the runtime still issues a per-
+  // op ihipMemcpy loop, so this is roughly on par with the fallback below
+  // but keeps submission in C++ and auto-upgrades when AMD wires real
+  // batching.
+  {
     size_t fail_idx = 0;
     hipError_t result = hipMemcpyBatchAsync(
         reinterpret_cast<void**>(dst_data), reinterpret_cast<void**>(src_data),
-        reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n), &attr,
-        &attrs_idx, 1, &fail_idx, static_cast<hipStream_t>(stream));
-    if (result == hipSuccess) return;
-    TORCH_CHECK(result == hipErrorNotSupported,
-                "hipMemcpyBatchAsync failed at index ", fail_idx,
-                " with error ", result);
-    batch_supported.store(false, std::memory_order_relaxed);
-    (void)hipGetLastError();  // clear the sticky stub error
+        reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n),
+        /*attrs=*/nullptr, /*attrsIdxs=*/nullptr, /*numAttrs=*/0,
+        &fail_idx, static_cast<hipStream_t>(stream));
+    TORCH_CHECK(result == hipSuccess, "hipMemcpyBatchAsync failed at index ",
+                fail_idx, " with error ", result);
+    return;
   }
 #endif
   {
-    // Fallback for CUDA < 12.8, older drivers, and ROCm without a working
-    // batch impl: individual async copies. cudaMemcpyDefault lets the
-    // driver infer direction from pointer types.
+    // Fallback for CUDA < 12.8, older CUDA drivers, and ROCm < 7.1:
+    // individual async copies. cudaMemcpyDefault lets the driver infer
+    // direction from pointer types.
     for (int64_t i = 0; i < n; i++) {
       cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
                       reinterpret_cast<void*>(src_data[i]),
