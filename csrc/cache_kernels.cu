@@ -147,8 +147,8 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     size_t fail_idx = 0;
     hipError_t result = hipMemcpyBatchAsync(
         reinterpret_cast<void**>(dst_data), reinterpret_cast<void**>(src_data),
-        reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n),
-        &attr, &attrs_idx, 0, &fail_idx, static_cast<hipStream_t>(stream));
+        reinterpret_cast<size_t*>(size_data), static_cast<size_t>(n), &attr,
+        &attrs_idx, 0, &fail_idx, static_cast<hipStream_t>(stream));
     TORCH_CHECK(result == hipSuccess, "hipMemcpyBatchAsync failed at index ",
                 fail_idx, " with error ", result);
     return;
