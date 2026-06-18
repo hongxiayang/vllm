@@ -757,6 +757,7 @@ class CompilationConfig:
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
+        "vllm::minimax_m3_sparse_attention",
     ]
 
     def compute_hash(self) -> str:

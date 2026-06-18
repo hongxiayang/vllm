@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -92,7 +93,10 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    direct_register_custom_op,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -338,6 +342,60 @@ class MiniMaxM3MoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
+def minimax_m3_dense_qknorm_rope(
+    qkv: torch.Tensor,  # [num_tokens, q_size + 2*kv_size], normed/roped in place
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+) -> None:
+    """Opaque op for the dense-attention QK-norm + partial RoPE (in place).
+
+    Thin custom-op boundary around ``fused_minimax_m3_qknorm_rope_kv_insert`` in
+    dense mode (no index branch, no KV insert). Registered so torch.compile keeps
+    it as one opaque in-graph node with a fake impl, instead of inlining the
+    optional-heavy Python wrapper / needing a meta kernel for the C++ op.
+    """
+    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        rotary_dim,
+        eps,
+        kv_cache_dtype="auto",
+    )
+
+
+def minimax_m3_dense_qknorm_rope_fake(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_dense_qknorm_rope",
+    op_func=minimax_m3_dense_qknorm_rope,
+    mutates_args=["qkv"],
+    fake_impl=minimax_m3_dense_qknorm_rope_fake,
+)
+
+
 class MiniMaxM3Attention(nn.Module):
     """Dense attention with per-head QK norm and partial RoPE."""
 
@@ -416,7 +474,10 @@ class MiniMaxM3Attention(nn.Module):
         # mode: no index branch, no KV-cache insert). Matches nvidia/model.py and
         # replaces the unfused split -> q_norm/k_norm -> rotary_emb chain; verified
         # bit-equivalent on ROCm (q/k rel ~2e-3 bf16 noise, v untouched).
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        # Routed through an opaque vLLM custom op (with a fake impl) so torch.compile
+        # neither inlines the optional-heavy Python wrapper (gb7312) nor needs a meta
+        # kernel for the underlying C++ op; it stays in-graph as one opaque node.
+        torch.ops.vllm.minimax_m3_dense_qknorm_rope(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -426,12 +487,91 @@ class MiniMaxM3Attention(nn.Module):
             self.num_kv_heads,
             self.rotary_emb.rotary_dim,
             self.q_norm.variance_epsilon,
-            kv_cache_dtype="auto",
         )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+
+@eager_break_during_capture
+def minimax_m3_sparse_attention(
+    positions: torch.Tensor,
+    qkv: torch.Tensor,
+    output: torch.Tensor,  # [num_tokens, q_size], written in place
+    layer_name: str,
+) -> None:
+    """Splitting custom op for the M3 sparse-attention core.
+
+    Wraps everything that depends on per-request metadata (the fused
+    QK-norm/RoPE/KV-insert, the lightning indexer, and the block-sparse GQA
+    attend) into one opaque op so the surrounding GEMMs (qkv_proj/o_proj) compile
+    while this stays out of the Inductor region. Its name is registered in
+    ``CompilationConfig._attention_ops`` so torch.compile splits the FX graph
+    here, mirroring ``unified_attention_with_output``. The
+    ``@eager_break_during_capture`` decorator additionally makes it a break point
+    under the breakable-cudagraph path (no-op when that path is disabled).
+
+    The layer is resolved from the forward context by ``layer_name`` (registered
+    in ``static_forward_context``); ``kv_cache``/index-cache mutations ride on it.
+    """
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    fwd_slot_mapping = forward_context.slot_mapping
+    num_tokens = qkv.shape[0]
+
+    if not isinstance(fwd_slot_mapping, dict) or layer_name not in fwd_slot_mapping:
+        # Memory-profiling run: caches not yet bound, slot_mapping is empty.
+        # Zeros flow through o_proj to the same all-zero result as the eager path.
+        output.zero_()
+        return
+
+    main_slot_mapping = fwd_slot_mapping[layer_name]
+    index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+    q = qkv.new_empty((num_tokens, self.q_size))
+    index_q = qkv.new_empty((num_tokens, self.index_q_size))
+    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        qkv,
+        self.q_norm.weight,
+        self.k_norm.weight,
+        self.rotary_emb.cos_sin_cache,
+        positions,
+        self.num_heads,
+        self.num_kv_heads,
+        self.rotary_emb.rotary_dim,
+        self.q_norm.variance_epsilon,
+        self.index_q_norm.weight,
+        self.index_k_norm.weight,
+        self.num_idx_heads,
+        main_slot_mapping,
+        index_slot_mapping,
+        self.kv_cache,
+        self.indexer.index_cache.kv_cache,
+        self.kv_cache.size(2),  # paged-cache block size
+        q,
+        index_q,
+        self.kv_cache_dtype,
+    )
+    # Indexer + block-sparse attend: split-K kernels reading per-request metadata.
+    topk_idx = self.indexer(index_q)
+    self.impl.forward(self, q, self.kv_cache, topk_idx, output)
+
+
+def minimax_m3_sparse_attention_fake(
+    positions: torch.Tensor,
+    qkv: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sparse_attention",
+    op_func=minimax_m3_sparse_attention,
+    mutates_args=["output"],
+    fake_impl=minimax_m3_sparse_attention_fake,
+)
 
 
 class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
@@ -593,73 +733,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Single fused projection emitting [q | k | v | index_q | index_k].
+        # Single fused projection emitting [q | k | v | index_q | index_k]. The
+        # qkv_proj / o_proj GEMMs stay in the compiled (Inductor) region; the
+        # metadata-dependent core (fused QK-norm/RoPE/KV-insert, lightning
+        # indexer, block-sparse attend) runs inside the opaque
+        # ``minimax_m3_sparse_attention`` splitting op, which the FX graph splits
+        # on (registered in CompilationConfig._attention_ops). The op writes the
+        # attention output in place; on the memory-profiling run it writes zeros.
         qkv, _ = self.qkv_proj(hidden_states)
-
-        # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
-        # main (q/k) and index (index_q/index_k) branches, all read straight out
-        # of the single fused ``qkv`` tensor. Once the paged caches are bound the
-        # kernel also inserts k/v and the index key into them (each with its own
-        # slot_mapping); the memory-profiling run (caches unbound, no slot_mapping)
-        # short-circuits to zeros below. The main and index slot mappings are read
-        # from the forward context's slot_mapping dict, matching the
-        # breakable-cudagraph path -- see nvidia/model.py.
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
-        rotary_dim = self.rotary_emb.rotary_dim
-        eps = self.q_norm.variance_epsilon
         num_tokens = qkv.shape[0]
-
-        fwd_slot_mapping = get_forward_context().slot_mapping
-        if (
-            not isinstance(fwd_slot_mapping, dict)
-            or self.layer_name not in fwd_slot_mapping
-        ):
-            # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
-
-        main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
-        q = qkv.new_empty((num_tokens, self.q_size))
-        index_q = qkv.new_empty((num_tokens, self.index_q_size))
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            cos_sin_cache,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            rotary_dim,
-            eps,
-            self.index_q_norm.weight,
-            self.index_k_norm.weight,
-            self.num_idx_heads,
-            main_slot_mapping,
-            index_slot_mapping,
-            self.kv_cache,
-            self.indexer.index_cache.kv_cache,
-            self.kv_cache.size(2),  # paged-cache block size
-            q,
-            index_q,
-            self.kv_cache_dtype,
+        attn_output = qkv.new_empty((num_tokens, self.q_size))
+        torch.ops.vllm.minimax_m3_sparse_attention(
+            positions, qkv, attn_output, self.layer_name
         )
-
-        output = torch.empty_like(q)
-        attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
-
-    @eager_break_during_capture
-    def _run_attention(
-        self,
-        query: torch.Tensor,
-        index_query: torch.Tensor,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        # Single eager break around both: their split-K kernels read per-request
-        # metadata and can't be captured into a cudagraph.
-        topk_idx = self.indexer(index_query)
-        return self.impl.forward(self, query, self.kv_cache, topk_idx, output)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -751,6 +839,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": {0: "b"},
+        "positions": {0: "b"},
+        "inputs_embeds": {0: "b"},
+    }
+)
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
