@@ -73,6 +73,7 @@ def _try_init_aiter_ar() -> bool:
         return False
     try:
         from vllm._aiter_ops import rocm_aiter_ops
+
         ar = rocm_aiter_ops.get_aiter_allreduce()
         if ar is not None:
             _set_aiter_ar(ar)
@@ -207,8 +208,7 @@ def fused_allreduce_gemma_rms_norm(
         hidden_dim = hidden_states.shape[-1]
         token_num = hidden_states.shape[0]
         pack_size = 16 // hidden_states.element_size()
-        hidden_ok = (hidden_dim % pack_size == 0
-                     and hidden_dim // pack_size <= 1024)
+        hidden_ok = hidden_dim % pack_size == 0 and hidden_dim // pack_size <= 1024
         token_ok = token_num <= 80
         world_size = aiter_ar.world_size
         full_nvlink = aiter_ar.fully_connected
