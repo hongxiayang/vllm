@@ -17,6 +17,10 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+# PROBE (shared-expert-fusion #3): toggle the shared expert's activation to the
+# bf16 aiter op via env, to measure the gsm8k impact in isolation before
+# building the full grouped-GEMM fusion. Default off (fp32 Triton swiglu).
+import os as _os
 from collections.abc import Iterable
 
 import torch
@@ -98,6 +102,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
+
+_SHARED_BF16_ACT_PROBE = _os.environ.get("MM3_SHARED_BF16_ACT", "0") == "1"
+# Fuse the single shared expert into the routed grouped-GEMM MoE (flydsl MXFP8
+# path), mirroring ATOM's num_fused_shared_experts. Opt-in; must match the same
+# env read in fused_moe/layer.py determine_expert_counts.
+_FUSE_SHARED = _os.environ.get("MM3_FUSE_SHARED_EXPERT", "0") == "1"
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -202,8 +212,14 @@ class MiniMaxM3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        bf16_activation: bool = False,
     ) -> None:
         super().__init__()
+        # PROBE (shared-expert-fusion #3): when True, use the bf16 aiter
+        # silu_and_mul_with_clamp op instead of the fp32 Triton swiglu, to
+        # measure the gsm8k impact of the activation precision the fused path
+        # would inherit. Default False keeps the accurate fp32 path.
+        self.bf16_activation = bf16_activation
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size] * 2,
@@ -235,12 +251,24 @@ class MiniMaxM3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = swiglu_oai_split(
-            gate_up,
-            alpha=self.swiglu_alpha,
-            beta=self.swiglu_beta,
-            limit=self.swiglu_limit,
-        )
+        if self.bf16_activation:
+            out = torch.empty(
+                gate_up.shape[0],
+                gate_up.shape[-1] // 2,
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
+            torch.ops._C.silu_and_mul_with_clamp(
+                out, gate_up, self.swiglu_limit, self.swiglu_alpha, self.swiglu_beta
+            )
+            x = out
+        else:
+            x = swiglu_oai_split(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
         x, _ = self.down_proj(x)
         return x
 
@@ -290,14 +318,19 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        # Fuse the single shared expert into the routed grouped GEMM when opted
+        # in: it becomes routed-expert slot ``num_local_experts``, reached by
+        # every token. Otherwise run it as a separate dense MLP (default).
+        self.fuse_shared_experts = bool(_FUSE_SHARED and self.n_shared_experts)
         self.shared_experts: MiniMaxM3MLP | None = None
-        if self.n_shared_experts:
+        if self.n_shared_experts and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.intermediate_size * self.n_shared_experts,
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                bf16_activation=_SHARED_BF16_ACT_PROBE,
             )
 
         self.experts = FusedMoE(
@@ -316,6 +349,9 @@ class MiniMaxM3MoE(nn.Module):
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
+            n_shared_experts=(
+                self.n_shared_experts if self.fuse_shared_experts else None
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
@@ -815,12 +851,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Checkpoint experts use w1=gate, w2=down, w3=up.
+        # When fusing the shared expert, include the appended slot
+        # (id == num_local_experts) so its weights load into the routed tensors.
+        n_shared = getattr(self.config, "n_shared_experts", 0) or 0
+        num_experts = self.config.num_local_experts + (n_shared if _FUSE_SHARED else 0)
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
+            num_experts=num_experts,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -856,6 +896,17 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # ModelOpt MXFP8 layers expose them as ``weight_scale``.
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
+
+            # Shared-expert fusion: redirect the checkpoint shared expert into
+            # routed-expert slot ``num_local_experts`` (gate->w1, up->w3,
+            # down->w2) so it loads via the routed expert weight loader. This
+            # runs before the stacked/dense mappings so shared_experts.gate_proj
+            # / up_proj are not captured by the dense gate_up_proj mapping.
+            if _FUSE_SHARED and ".shared_experts." in name:
+                sid = self.config.num_local_experts
+                name = name.replace(".shared_experts.gate_proj.", f".experts.{sid}.w1.")
+                name = name.replace(".shared_experts.up_proj.", f".experts.{sid}.w3.")
+                name = name.replace(".shared_experts.down_proj.", f".experts.{sid}.w2.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

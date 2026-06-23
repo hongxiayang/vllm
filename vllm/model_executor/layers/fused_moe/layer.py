@@ -81,9 +81,15 @@ def determine_expert_counts(
     # AITER only supports gated activations (silu/gelu), so disable it
     # for non-gated MoE (is_act_and_mul=False)
     # rocm_aiter_fmoe_enabled = rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul
+    # MM3 flydsl MXFP8 path: fuse the shared expert into the grouped GEMM
+    # independently of the native aiter master switch (opt-in env). The shared
+    # expert is appended as a routed-expert slot and routed to by every token.
+    import os as _os
+
+    _flydsl_force_shared = _os.environ.get("MM3_FUSE_SHARED_EXPERT", "0") == "1"
     aiter_fmoe_shared_expert_enabled = (
-        rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and is_act_and_mul
-    )
+        rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() or _flydsl_force_shared
+    ) and is_act_and_mul
 
     num_fused_shared_experts = (
         n_shared_experts
@@ -288,6 +294,19 @@ def FusedMoE(
             else 1.0,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=num_fused_shared_experts,
+            # Fused shared-expert slot weight. With apply_routed_scale_to_output
+            # the runner scales the combined output by routed_scaling_factor, so
+            # the shared slot weight must be 1/routed_scaling_factor for its net
+            # contribution to be 1.0 (matching the un-scaled separate-MLP add).
+            shared_expert_weight=(
+                (1.0 / routed_scaling_factor)
+                if (
+                    apply_routed_scale_to_output
+                    and num_fused_shared_experts > 0
+                    and routed_scaling_factor
+                )
+                else 1.0
+            ),
             zero_expert_type=zero_expert_type,
             num_logical_experts=logical_num_experts,
             hash_indices_table=hash_indices_table,
