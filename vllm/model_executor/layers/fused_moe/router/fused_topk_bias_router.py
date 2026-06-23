@@ -348,8 +348,8 @@ class FusedTopKBiasRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
-        # Fused shared experts: append constant slots (the top expert ids,
-        # [global-n_shared, global)) routed to by every token at
+        # Fused shared experts: append constant slots (ids immediately after
+        # the routed experts, [global, global+n)) routed to by every token at
         # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
         self.num_fused_shared_experts = num_fused_shared_experts
         self.shared_expert_weight = shared_expert_weight
@@ -392,7 +392,10 @@ class FusedTopKBiasRouter(BaseRouter):
         if self.num_fused_shared_experts > 0:
             m = topk_ids.shape[0]
             n = self.num_fused_shared_experts
-            base = self.global_num_experts - n
+            # global_num_experts counts only the routed experts; the fused
+            # shared experts occupy the slots immediately after them, i.e. ids
+            # [global_num_experts, global_num_experts + n).
+            base = self.global_num_experts
             shared_ids = torch.arange(
                 base, base + n, dtype=topk_ids.dtype, device=topk_ids.device
             ).expand(m, n)
