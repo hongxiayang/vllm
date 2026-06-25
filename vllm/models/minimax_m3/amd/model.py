@@ -276,6 +276,40 @@ def _m3_fused_shared_experts_enabled() -> bool:
     return rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
 
 
+def _fuse_shared_experts_enabled(config: PretrainedConfig) -> bool:
+    """Backend-neutral (router-append) shared-expert fusion.
+
+    Alternative to the aiter grouped-topk fusion above: appends the shared
+    expert at the bias-router level, so it runs on the triton/flydsl mxfp8 MoE
+    independent of the aiter master switch. ROCm only, opt-in via
+    ``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS``; disabled under expert
+    parallelism (the appended slot is not handled by the EP expert-map path).
+    """
+    from vllm.platforms import current_platform
+
+    return bool(
+        current_platform.is_rocm()
+        and getattr(config, "n_shared_experts", None)
+        and envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        and not get_current_vllm_config().parallel_config.enable_expert_parallel
+    )
+
+
+def _shared_expert_fused(config: PretrainedConfig) -> bool:
+    """True when either mechanism folds the shared expert into routed slots.
+
+    Both fusions use the identical weight remap (shared expert -> routed slot
+    ``num_local_experts``), so weight loading keys on either being active.
+    """
+    return bool(
+        getattr(config, "n_shared_experts", 0)
+        and (
+            _m3_fused_shared_experts_enabled()
+            or _fuse_shared_experts_enabled(config)
+        )
+    )
+
+
 class MiniMaxM3MoE(nn.Module):
     """Sigmoid-routed MoE block with a routing-bias correction and a shared
     expert."""
@@ -324,8 +358,21 @@ class MiniMaxM3MoE(nn.Module):
         # When shared-expert fusion is enabled, the shared expert is folded into
         # the routed MoE call as the last expert slot (its weights load into that
         # slot), so we don't build a separate module.
-        self.fuse_shared_experts = bool(
+        # Two mutually-exclusive shared-expert fusion mechanisms (grouped-topk
+        # wins when both are eligible): the aiter master-switch grouped-topk
+        # path, and the backend-neutral router-append path for the flydsl/
+        # triton mxfp8 MoE. Both fold the shared expert into routed slot
+        # num_local_experts with the same weight remap.
+        self._grouped_shared_fusion = bool(
             self.n_shared_experts and _m3_fused_shared_experts_enabled()
+        )
+        self._router_append_fusion = bool(
+            self.n_shared_experts
+            and not self._grouped_shared_fusion
+            and _fuse_shared_experts_enabled(config)
+        )
+        self.fuse_shared_experts = (
+            self._grouped_shared_fusion or self._router_append_fusion
         )
 
         self.shared_experts: MiniMaxM3MLP | None = None
@@ -352,14 +399,15 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             renormalize=True,
-            use_grouped_topk=self.fuse_shared_experts,
-            num_expert_group=1 if self.fuse_shared_experts else None,
-            topk_group=1 if self.fuse_shared_experts else None,
+            use_grouped_topk=self._grouped_shared_fusion,
+            num_expert_group=1 if self._grouped_shared_fusion else None,
+            topk_group=1 if self._grouped_shared_fusion else None,
             activation="swigluoai_uninterleave",
             swiglu_limit=config.swiglu_limit,
             swiglu_alpha=config.swiglu_alpha,
             swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scale_to_output=self._router_append_fusion,
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             n_shared_experts=(
@@ -913,7 +961,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # their (synthesized) ``experts.{N+j}`` weights map into the widened
         # expert tensors.
         num_experts = self.config.num_local_experts
-        if _m3_fused_shared_experts_enabled() and self.config.n_shared_experts:
+        if _shared_expert_fused(self.config):
             num_experts += self.config.n_shared_experts
         return fused_moe_make_expert_params_mapping(
             self,
@@ -948,9 +996,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # When shared-expert fusion is on, the shared expert is the last expert
         # slot; redirect its checkpoint weights there. M3 has a single shared
         # expert (n_shared_experts == 1), so it maps to slot num_local_experts.
-        fuse_shared_experts = bool(
-            _m3_fused_shared_experts_enabled() and self.config.n_shared_experts
-        )
+        fuse_shared_experts = _shared_expert_fused(self.config)
         shared_slot = self.config.num_local_experts
 
         params_dict = dict(self.named_parameters())
