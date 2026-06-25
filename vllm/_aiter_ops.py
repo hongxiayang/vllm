@@ -171,6 +171,7 @@ def _rocm_aiter_fused_moe_impl(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -203,6 +204,7 @@ def _rocm_aiter_fused_moe_impl(
         bias1=bias1,
         bias2=bias2,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        swiglu_limit=swiglu_limit,
         **extra_kwargs,
     )
 
@@ -229,6 +231,7 @@ def _rocm_aiter_fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     if output_dtype is not None:
         return torch.empty_like(hidden_states, dtype=output_dtype)
@@ -1650,6 +1653,17 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._FMOE_ENABLED
 
     @classmethod
+    def set_fusion_moe_shared_experts_enabled(cls, enabled: bool = True) -> None:
+        """Hint that the loaded model wants aiter fused shared experts (FSE).
+
+        Lets a model (e.g. MiniMax-M3) request shared-expert fusion without
+        mutating the environment. An explicit user setting of
+        VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS still takes precedence.
+        """
+        if not envs.is_set("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS"):
+            cls._MOE_SHARED_EXPERTS_ENABLED = enabled
+
+    @classmethod
     @if_aiter_supported
     def is_fusion_moe_shared_experts_enabled(cls) -> bool:
         return cls.is_fused_moe_enabled() and cls._MOE_SHARED_EXPERTS_ENABLED
@@ -2201,6 +2215,7 @@ class rocm_aiter_ops:
         bias1: torch.Tensor | None = None,
         bias2: torch.Tensor | None = None,
         moe_sorting_dispatch_policy: int = 0,
+        swiglu_limit: float = 0.0,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -2224,6 +2239,7 @@ class rocm_aiter_ops:
             bias1,
             bias2,
             moe_sorting_dispatch_policy,
+            swiglu_limit,
         )
 
     @staticmethod
@@ -2677,6 +2693,31 @@ class rocm_aiter_ops:
         from aiter.ops.shuffle import shuffle_weight
 
         return tuple(shuffle_weight(tensor, layout=layout) for tensor in tensors)
+
+    @staticmethod
+    def shuffle_mxfp8_moe_weights(
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preshuffle MXFP8 MoE weights + E8M0 scales into AITER's FlyDSL layout:
+        gate/up-interleaved weights, interleaved scale for w13 (gate/up), plain
+        scale for w2 (the interleaved variant is gate/up-only and misaligns w2).
+        """
+        from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+
+        num_experts = w13.shape[0]
+        w13 = shuffle_weight(w13, is_guinterleave=True, gate_up=True)
+        w2 = shuffle_weight(w2, is_guinterleave=True, gate_up=False)
+        w13_scale = shuffle_scale(
+            w13_scale.reshape(-1, w13_scale.shape[-1]),
+            num_experts,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        w2_scale = shuffle_scale(w2_scale.reshape(-1, w2_scale.shape[-1]))
+        return w13, w2, w13_scale, w2_scale
 
     @staticmethod
     def flash_attn_varlen_func(
