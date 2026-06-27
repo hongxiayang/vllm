@@ -19,7 +19,6 @@ and the top-k weighted reduction run in PyTorch between/after the two GEMMs.
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
     Mxfp8TritonExpertsBase,
 )
@@ -32,7 +31,27 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
-logger = init_logger(__name__)
+
+def _select_cfg(K):
+    """Pick the grouped-GEMM launch config from the host-known K — graph-capture
+    safe (no GPU-scalar branch).
+
+    BLOCK_K=256 (fewer K-iters + a bigger MX scale-load coalesced with the dot) when
+    it divides K, else 128 (the K-loop is unmasked, so BLOCK_K must divide K; the
+    launcher asserts K%128==0). GROUP_SIZE_M=4 is an XCD-friendly swizzle that keeps
+    each touched expert's A rows + B column-tiles L2/MALL-resident across its N-tiles,
+    killing the redundant A re-read. num_stages=2 software-pipelines the E8M0
+    scale-load with the scaled MFMA; num_warps=8 (wave64 fits VGPR without spilling).
+    Math is unchanged vs the prior fixed-tile launcher.
+    """
+    BLOCK_K = 256 if K % 256 == 0 else 128
+    return {
+        "BLOCK_N": 128,
+        "BLOCK_K": BLOCK_K,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 8,
+        "num_stages": 2,
+    }
 
 
 @triton.jit
@@ -46,6 +65,7 @@ def _mxfp8_grouped_gemm_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    EM,
     N,
     K,
     num_valid_tokens,
@@ -67,10 +87,25 @@ def _mxfp8_grouped_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    # Grid-swizzle (super-grouping over M) so consecutive program-ids cover a
+    # GROUP_SIZE_M x grid_n super-block, keeping each touched expert's A rows + its
+    # B-weight column-tiles L2/MALL-resident across the N-tiles they share (kills the
+    # redundant A re-read: dot_scaled keeps operands in registers, so A is otherwise
+    # re-fetched per N-tile). num_pid_m is derived from EM (the host m-extent the grid
+    # is launched with), NOT from num_post, so the grid and the swizzle agree and no
+    # program-id maps to an empty group; num_post only early-returns the pad tiles.
+    pid = tl.program_id(0)
     num_post = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(EM, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
     if pid_m * BLOCK_M >= num_post:
         return
 
@@ -140,9 +175,6 @@ def _grouped_gemm_mxfp8(
     a_div: int,
     mul_weight_by: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
-    block_n: int = 128,
-    num_warps: int = 8,
-    num_stages: int = 2,
 ) -> torch.Tensor:
     M_routed = num_valid_tokens
     E, N, K = w.shape
@@ -152,8 +184,15 @@ def _grouped_gemm_mxfp8(
     # written — zero them so the downstream reduction ignores their garbage.
     alloc = torch.zeros if expert_map is not None else torch.empty
     out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
-    BLOCK_K = 128
-    grid = (triton.cdiv(sorted_token_ids.shape[0], block_m), triton.cdiv(N, block_n))
+
+    cfg = _select_cfg(K)
+    BLOCK_N = cfg["BLOCK_N"]
+    GROUP_SIZE_M = cfg["GROUP_SIZE_M"]
+
+    # 1-D grid; EM = the padded m-extent the kernel swizzle maps over (must match
+    # num_pid_m = cdiv(EM, BLOCK_M) inside the kernel).
+    EM = sorted_token_ids.shape[0]
+    grid = (triton.cdiv(EM, block_m) * triton.cdiv(N, BLOCK_N),)
     _mxfp8_grouped_gemm_kernel[grid](
         a_q,
         a_scale,
@@ -164,6 +203,7 @@ def _grouped_gemm_mxfp8(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        EM,
         N,
         K,
         num_valid_tokens,
@@ -183,27 +223,13 @@ def _grouped_gemm_mxfp8(
         A_DIV=a_div,
         MUL_WEIGHT=mul_weight_by is not None,
         BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=BLOCK_K,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=cfg["BLOCK_K"],
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
     )
     return out
-
-
-# Tuned native-MXFP8 launch tiles for gfx950 (CDNA4) at MiniMax-M3 MoE shapes.
-# For example, 8k/1k, 1k/1k cases.
-
-_MXFP8_PREFILL_TILES = dict(block_m=128, block_n=256, num_warps=8, num_stages=2)
-_MXFP8_DECODE_TILES = dict(block_m=64, block_n=64, num_warps=4, num_stages=2)
-_MXFP8_PREFILL_MIN_TOKENS = 1024
-
-
-def _mxfp8_moe_tiles(num_tokens: int) -> dict:
-    """Pick grouped-GEMM launch tiles by regime (token count)."""
-    if num_tokens >= _MXFP8_PREFILL_MIN_TOKENS:
-        return _MXFP8_PREFILL_TILES
-    return _MXFP8_DECODE_TILES
 
 
 def fused_moe_mxfp8_native(
@@ -225,8 +251,7 @@ def fused_moe_mxfp8_native(
     top_k = topk_ids.shape[1]
     M = T * top_k
 
-    tiles = _mxfp8_moe_tiles(T)
-    block_m = tiles["block_m"]
+    block_m = 64
     # Bin by the actual number of expert weight rows. With fused shared experts
     # the weight tensor has more rows than ``global_num_experts`` (the routed
     # count), and their ids fall outside [0, global_num_experts); binning by the
@@ -257,9 +282,6 @@ def fused_moe_mxfp8_native(
         hidden_states.dtype,
         a_div=top_k,
         expert_map=expert_map,
-        block_n=tiles["block_n"],
-        num_warps=tiles["num_warps"],
-        num_stages=tiles["num_stages"],
     )  # [M, 2I]
 
     # SwiGLU-OAI (split layout: gate=g1[:, :I], up=g1[:, I:]) FUSED with the
@@ -288,9 +310,6 @@ def fused_moe_mxfp8_native(
         a_div=1,
         mul_weight_by=topk_weights.reshape(-1).to(torch.float32),
         expert_map=expert_map,
-        block_n=tiles["block_n"],
-        num_warps=tiles["num_warps"],
-        num_stages=tiles["num_stages"],
     )  # [M, H] == [T*top_k, H]
 
     return g2.view(T, top_k, H).sum(dim=1).to(hidden_states.dtype)
