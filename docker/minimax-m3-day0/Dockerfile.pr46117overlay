@@ -1,0 +1,35 @@
+# Python-only overlay: drop the upstream PR vllm-project/vllm#46117 MXFP8
+# dense-linear + grouped-MoE GEMM kernels (head 4ed9352a, rebased onto main on
+# branch `pr-46117`) onto the ROCm nightly image WITHOUT recompiling csrc.
+# The PR is 2 pure-Python files; every kernel they call is already in nightly.
+#
+# Build (context = repo root, on branch pr-46117):
+#   git checkout pr-46117
+#   docker build -f docker/minimax-m3-day0/Dockerfile.pr46117overlay \
+#     -t vllm/vllm-openai-rocm:nightly-pr46117 .
+#
+# Verify the triton MoE no longer hits 'out of resource':
+#   docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+#     --entrypoint python vllm/vllm-openai-rocm:nightly-pr46117 \
+#     /opt/repro/repro_oor.py
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:nightly
+FROM ${BASE_IMAGE}
+
+ARG VLLM=/usr/local/lib/python3.12/dist-packages/vllm
+
+# Overlay only the two files the PR changes (COPY merges into the tree).
+COPY vllm/model_executor/kernels/linear/mxfp8/rocm_native.py \
+     ${VLLM}/model_executor/kernels/linear/mxfp8/rocm_native.py
+COPY vllm/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py \
+     ${VLLM}/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py
+
+# Drop the OOR reproducer + the PR's own MoE/dense kernel tests in for convenience.
+COPY docker/minimax-m3-day0/scripts/repro_oor.py /opt/repro/repro_oor.py
+COPY tests/kernels/test_minimax_m3_amd_ops.py /opt/repro/test_minimax_m3_amd_ops.py
+
+# Fail the build if the overlaid files don't import (catches path drift early).
+RUN python -c "import importlib; \
+    importlib.import_module('vllm.model_executor.kernels.linear.mxfp8.rocm_native'); \
+    importlib.import_module('vllm.model_executor.layers.fused_moe.experts.mxfp8_native_moe'); \
+    print('PR#46117 overlay import OK')"

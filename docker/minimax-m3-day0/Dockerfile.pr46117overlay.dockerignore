@@ -1,0 +1,5 @@
+*
+!vllm/model_executor/kernels/linear/mxfp8/rocm_native.py
+!vllm/model_executor/layers/fused_moe/experts/mxfp8_native_moe.py
+!docker/minimax-m3-day0/scripts/repro_oor.py
+!tests/kernels/test_minimax_m3_amd_ops.py
