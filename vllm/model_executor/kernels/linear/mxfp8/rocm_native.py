@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native MXFP8 linear GEMM for AMD CDNA4 (gfx950) via Triton ``tl.dot_scaled``.
+"""Native MXFP8 dense linear for AMD CDNA4 (gfx950) via Triton ``tl.dot_scaled``.
 
 Consumes the FP8 E4M3 weights + E8M0 block scales directly (no dequant-to-BF16);
-activations are MXFP8-quantized per token. Uses the CDNA4 hardware microscaling
-matrix cores. Falls back (via the kernel selector) to the BF16
+activations are MXFP8-quantized per token via the shared fused
+``mxfp8_e4m3_quantize``. A shape/occupancy-aware tile selector (``_select_cfg``)
+picks the ``dot_scaled`` launch config from the local (M, N, K), so it adapts to
+TP-sharded layouts. Falls back (via the kernel selector) to the BF16
 ``EmulationMxfp8LinearKernel`` on archs without native MX or for shapes with
-``K % 128 != 0``.
+``K % 128 != 0``. Math is unchanged vs the prior kernel (fp32 accumulate).
 """
 
 import torch
@@ -89,13 +91,7 @@ def _mxfp8_dot_scaled_linear(
     N = w.shape[0]
     x_q, x_scale = mxfp8_e4m3_quantize(x)
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    # Regime-gated launch tiles for gfx950, tuned at MiniMax-M3 shapes:
-    # for example, 8k/1k, 1k/1k
-    if M >= 1024:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 256, 8, 2
-    else:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-    BLOCK_K = 128
+    BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = _select_cfg(M, N, K)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mxfp8_linear_kernel[grid](
         x_q,
@@ -123,6 +119,72 @@ def _mxfp8_dot_scaled_linear(
         num_stages=num_stages,
     )
     return out
+
+
+def _select_cfg(M, N, K):
+    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) — graph-tuned on gfx950.
+
+    Occupancy- and shape-aware: keyed on the LOCAL (M, N, K), so it adapts to the
+    TP-sharded shapes (e.g. MiniMax-M3 TP=4 vs TP=8, where local N and K differ).
+    BLOCK_K must divide K (the K-loop is unmasked), so every BLOCK_K below is guarded
+    to be K-divisible (served K: 384/768/1024/2048/6144).
+    """
+    if M <= 64:
+        # decode (M in {1,32,64}): tiny-M GEMV is weight-BW + GPU-OCCUPANCY bound. The
+        # lever is NARROW BLOCK_N=16 (maximize N-tiles so more CUs stream the weight in
+        # parallel) + LARGE BLOCK_K (fewer K-iters, bigger coalesced weight loads).
+        # Tuned by CUDA-graph replay latency. Optimal at both TP=4 and TP=8.
+        if K % 1024 == 0:  # K=2048, 6144 -> graph-best 16x16x1024 (all M)
+            return 16, 16, 1024, 2, 2
+        if K % 512 == 0:
+            return 16, 16, 512, 2, 3
+        if K % 256 == 0:  # K=768 (shared_down) -> graph-best 16x32x256
+            return 16, 32, 256, 4, 3
+        return 16, 32, 128, 4, 3
+    # mid-M (65..256) on SMALL local-N: still occupancy-bound (a 64x64 tile makes too
+    # few N-tiles), so the narrow-BLOCK_N decode-style tile fills the CUs better.
+    # N<=1536 covers the real fused-qkv local N at TP=8: q heads shard but the GQA KV
+    # (4) + sparse-indexer (4) heads are < TP=8, so vLLM replicates them to 1/rank ->
+    # N = 1024 + 4*128 = 1536 (not 2560/2=1280). For the wider 1280<N<=1536 band the
+    # narrow tile only wins up to M=128 (at M=256 the 64x64 tile is better), so cap it
+    # there; N<=1280 keeps the narrow tile through M=256. TP=4 qkv N=2560 is unchanged.
+    if (M <= 256 and N <= 1280) or (M <= 128 and N <= 1536):
+        if K % 1024 == 0:
+            return 16, 16, 1024, 2, 2
+        if K % 512 == 0:
+            return 16, 16, 512, 2, 3
+        if K % 256 == 0:
+            return 16, 16, 256, 2, 3
+        return 16, 16, 128, 2, 3
+    # right-sized launch grid (host-side), used to gate the tall 256-BLOCK_M tile.
+    occ = triton.cdiv(M, 256) * triton.cdiv(N, 128)
+    if K <= 1024:  # short-K (shared_down K=384/768; TP=8 o_proj K=1024)
+        if M <= 256:
+            return (64, 64, 256, 8, 2) if K % 256 == 0 else (64, 64, 128, 8, 2)
+        # large prefill: BLOCK_K=256 (needs K%256==0) when the grid fills the CUs,
+        # else 128. BLOCK_M stays 128 — a 256-tall tile (256x128x256) overflows the
+        # 160KB CDNA4 LDS at num_stages=2 and benchmarks slower than 128x128x256.
+        if M >= 4096 and K >= 1024 and K % 256 == 0 and occ >= 256:
+            return 128, 128, 256, 8, 2
+        return 128, 128, 128, 8, 3
+    # large-K (K >= 2048). BLOCK_K is K-divisibility-guarded (the K-loop is unmasked):
+    # served large-K is 2048/6144 (%256==0), but fall back to 128 (always divides, since
+    # the entry requires K%128==0) for any other K to stay correct.
+    if M <= 256:  # conc~128 decode + small prefill chunk: occupancy tile
+        if K % 512 == 0:
+            return 64, 64, 512, 8, 2
+        return (64, 64, 256, 8, 2) if K % 256 == 0 else (64, 64, 128, 8, 2)
+    if M <= 1024:  # medium prefill chunk: BN=64 keeps small-N occupied
+        return (128, 64, 256, 8, 3) if K % 256 == 0 else (128, 64, 128, 8, 3)
+    # large prefill (M > 1024). BLOCK_M and BLOCK_K are bounded by the 160KB CDNA4 LDS
+    # at num_stages=2: both a 256-tall tile (256x128x256) and a deep 128x128x512 tile
+    # overflow it, and in benchmarks 128x128x256 is faster than either fitting variant,
+    # so it is the deep-K / large-M default.
+    # small local-N (e.g. TP=8 shared_gate_up N=768): a 64-wide BLOCK_N doubles the
+    # N-tile count -> better CU fill than 128x128 at this mid-large M.
+    if N <= 1024 and K % 256 == 0:
+        return 128, 64, 256, 8, 3
+    return (128, 128, 256, 8, 2) if K % 256 == 0 else (128, 256, 128, 8, 3)
 
 
 class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
