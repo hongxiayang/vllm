@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -11,6 +13,10 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.v1.worker.ubatching import (
+    dbo_switch_to_compute_sync,
+    dbo_yield_and_switch_from_compute_to_comm,
+)
 
 
 def _quantize_and_setup_dispatch(
@@ -109,6 +115,14 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     def output_is_reduced(self) -> bool:
         return False
 
+    def supports_async(self) -> bool:
+        # Async prepare/finalize lets the modular kernel overlap the DP
+        # all-gather (dispatch) / reduce-scatter (combine) with the sibling
+        # micro-batch's expert compute under DBO. When DBO is off the dbo_*
+        # stream switches are no-ops, so the async path runs the collective
+        # inline and is numerically identical to the sync path.
+        return True
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -120,7 +134,35 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        """Quantize and Dispatch Topk Weights and Topk Ids."""
+        receiver = self.prepare_async(
+            a1,
+            topk_weights,
+            topk_ids,
+            num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            quant_config,
+            defer_input_quant,
+        )
+        return receiver()
+
+    def prepare_async(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
+    ) -> mk.ReceiverType:
+        """Quantize, then launch the dispatch all-gather on the comm stream.
+
+        Returns a receiver that unpacks the gathered tensors. Under DBO the
+        all-gather runs on the comm stream while the sibling micro-batch
+        computes; ``dbo_switch_to_compute_sync`` orders the experts after it.
+        """
 
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
@@ -155,6 +197,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                 extra_tensors = []
             extra_tensors.append(local_token_lora_mapping)
 
+        # Run the all-gather on the comm stream, overlapping the sibling
+        # micro-batch's compute (no-op when DBO is off).
+        dbo_yield_and_switch_from_compute_to_comm()
         res = get_ep_group().dispatch(
             a1q,
             topk_weights,
@@ -162,27 +207,31 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             is_sequence_parallel=self.is_sequence_parallel,
             extra_tensors=extra_tensors,
         )
+        dbo_switch_to_compute_sync()
 
-        if extra_tensors is None:
-            assert len(res) == 3
-            a1q, topk_weights, topk_ids = res
-            a1q_scale = a1q_scale_orig
-        else:
-            assert len(res) == 4
-            a1q, topk_weights, topk_ids, gathered_extras = res
-            gathered_extras = list(gathered_extras)
-            if local_token_lora_mapping is not None:
-                dispatched_lora_mapping = gathered_extras.pop()
-                assert lora_ctx is not None
-                lora_ctx.local_token_lora_mapping = dispatched_lora_mapping
-            if scales is not None:
-                a1q_scale = _unwrap_scale_and_prepare_for_moe(
-                    gathered_extras, quant_config
-                )
-            else:
+        def receiver() -> mk.PrepareResultType:
+            if extra_tensors is None:
+                assert len(res) == 3
+                g_a1q, g_topk_weights, g_topk_ids = res
                 a1q_scale = a1q_scale_orig
+            else:
+                assert len(res) == 4
+                g_a1q, g_topk_weights, g_topk_ids, gathered_extras = res
+                gathered_extras = list(gathered_extras)
+                if local_token_lora_mapping is not None:
+                    dispatched_lora_mapping = gathered_extras.pop()
+                    assert lora_ctx is not None
+                    lora_ctx.local_token_lora_mapping = dispatched_lora_mapping
+                if scales is not None:
+                    a1q_scale = _unwrap_scale_and_prepare_for_moe(
+                        gathered_extras, quant_config
+                    )
+                else:
+                    a1q_scale = a1q_scale_orig
 
-        return a1q, a1q_scale, None, topk_ids, topk_weights
+            return g_a1q, a1q_scale, None, g_topk_ids, g_topk_weights
+
+        return receiver
 
     def finalize(
         self,
@@ -193,6 +242,29 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
+        receiver = self.finalize_async(
+            output,
+            fused_expert_output,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            weight_and_reduce_impl,
+        )
+        receiver()
+
+    def finalize_async(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> Callable:
+        """Weight/reduce locally, then launch the combine reduce-scatter on the
+        comm stream. Returns a receiver that copies the result into ``output``.
+        Under DBO the reduce-scatter overlaps the sibling micro-batch's compute.
+        """
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 
@@ -204,9 +276,16 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        dbo_yield_and_switch_from_compute_to_comm()
+        combined = get_ep_group().combine(
+            out, is_sequence_parallel=self.is_sequence_parallel
         )
+        dbo_switch_to_compute_sync()
+
+        def receiver() -> None:
+            output.copy_(combined)
+
+        return receiver
 
 
 class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):

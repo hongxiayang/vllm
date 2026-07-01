@@ -780,7 +780,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # int4-aligned for build_k2q_csr's vectorised int4 loads.
             max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             padded_num_tokens = (max_num_batched_tokens + 3) // 4 * 4
+            # Leading dim = one slot per DBO micro-batch (1 when DBO is off) so
+            # concurrent ubatch threads never race; indexer write and attend read
+            # select it via dbo_current_ubatch_id(). buf[ubid] keeps the inner
+            # [heads, tokens, topk] strides (int4 head-stride alignment intact).
             self.topk_indices_buffer = torch.empty(
+                max(1, vllm_config.parallel_config.num_ubatches),
                 num_index_heads,
                 padded_num_tokens,
                 sparse_cfg["sparse_topk_blocks"],

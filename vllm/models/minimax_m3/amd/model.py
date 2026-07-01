@@ -848,12 +848,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         # Reserved top-k indices buffer shared by all sparse-attention indexer
         # layers (mirrors DeepseekV4); the indexer writes its per-head decode/
-        # prefill block selection into it, the attend reads it back.
+        # prefill block selection into it, the attend reads it back. The leading
+        # dim is one slot per DBO micro-batch (1 when DBO is off) so the two
+        # concurrent ubatch threads never race on the shared buffer; both the
+        # indexer write and the attend read index it by dbo_current_ubatch_id().
         sparse_cfg = getattr(config, "sparse_attention_config", None)
         if sparse_cfg is not None:
             tp_size = get_tensor_model_parallel_world_size()
             num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
             self.topk_indices_buffer = torch.empty(
+                max(1, vllm_config.parallel_config.num_ubatches),
                 num_index_heads,
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 sparse_cfg["sparse_topk_blocks"],

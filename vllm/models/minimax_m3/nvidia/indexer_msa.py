@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 # Page size == sparse block size == index-K block; fmha tile id == M3 block id.
 PAGE_SIZE = 128
@@ -197,7 +198,10 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
         kv = self.index_cache.kv_cache
         # Both sides write into the single shared persistent topk_indices_buffer:
         # decode at [:, :nd], prefill at [:, nd:] (each kernel writes [:, :total_q]).
+        # Select this micro-batch's slot (0 when DBO is off) to avoid races.
         buf = self.topk_indices_buffer
+        if buf is not None:
+            buf = buf[dbo_current_ubatch_id()]
 
         decode_topk: torch.Tensor | None = None
         if md.decode is not None:

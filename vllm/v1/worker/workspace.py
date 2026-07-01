@@ -190,6 +190,41 @@ class WorkspaceManager:
 
         return current_workspace
 
+    def equalize_ubatch_slots(self) -> None:
+        """Grow every ubatch workspace slot to the size of the largest slot.
+
+        Called once during warmup (single-threaded, before ``lock``) so that
+        all per-ubatch slots are reserved for the largest workspace seen so
+        far. Warmup only exercises a subset of slots at their full size (e.g.
+        the non-ubatch profile run sizes slot 0 to the max-token MoE workspace,
+        and decode ubatch capture sizes all slots but only at the small decode
+        size). Without equalizing, the first runtime *prefill* ubatch would try
+        to grow a decode-sized slot while the workspace is locked and hit the
+        lock assertion. Safe to cross-size here because there is no concurrent
+        ubatch execution holding views into these buffers at this point.
+        """
+        assert not self._locked, "equalize_ubatch_slots must run before lock()"
+        max_bytes = max(
+            (self._workspace_size_bytes(ws) for ws in self._current_workspaces),
+            default=0,
+        )
+        if max_bytes == 0:
+            return
+        for i, ws in enumerate(self._current_workspaces):
+            if self._workspace_size_bytes(ws) < max_bytes:
+                self._current_workspaces[i] = None
+                del ws
+                torch.accelerator.empty_cache()
+                self._current_workspaces[i] = torch.empty(
+                    (max_bytes,), dtype=torch.uint8, device=self._device
+                )
+        if envs.VLLM_DEBUG_WORKSPACE:
+            logger.info(
+                "[WORKSPACE DEBUG] Equalized %d ubatch slots to %.2f MB",
+                self._num_ubatches,
+                max_bytes / _MB,
+            )
+
 
 def is_workspace_manager_initialized() -> bool:
     """Check if workspace manager has been initialized.
@@ -256,6 +291,16 @@ def lock_workspace() -> None:
         # Now all get_workspace calls must fit in pre-allocated size
     """
     current_workspace_manager().lock()
+
+
+def equalize_ubatch_workspaces() -> None:
+    """Reserve every ubatch workspace slot at the largest slot's size.
+
+    Must be called during warmup, single-threaded, before ``lock_workspace()``.
+    Prevents a locked-workspace growth crash when the first runtime prefill
+    ubatch needs a larger slot than warmup exercised for it.
+    """
+    current_workspace_manager().equalize_ubatch_slots()
 
 
 def unlock_workspace() -> None:

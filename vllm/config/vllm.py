@@ -1447,13 +1447,16 @@ class VllmConfig:
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
+                "allgather_reducescatter",
             ], (
                 "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
-                f"{a2a_backend} is not supported. To fix use "
+                "deepep_high_throughput, nixl_ep, and allgather_reducescatter "
+                f"all2all backends. {a2a_backend} is not supported. To fix use "
                 "--all2all-backend=deepep_low_latency, "
-                "--all2all-backend=deepep_high_throughput, or "
-                "--all2all-backend=nixl_ep and install the matching kernels."
+                "--all2all-backend=deepep_high_throughput, "
+                "--all2all-backend=nixl_ep, or "
+                "--all2all-backend=allgather_reducescatter and install the "
+                "matching kernels."
             )
 
             if not self.model_config.disable_cascade_attn:

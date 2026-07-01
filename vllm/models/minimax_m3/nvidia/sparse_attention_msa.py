@@ -19,6 +19,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseMetadata,
 )
 from vllm.v1.attention.backend import AttentionLayer
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 
 class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
@@ -40,8 +41,10 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         nd = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
         # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
+        # Select this micro-batch's slot (0 when DBO is off) to match the write.
         topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
         assert topk is not None
+        topk = topk[dbo_current_ubatch_id()]
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)

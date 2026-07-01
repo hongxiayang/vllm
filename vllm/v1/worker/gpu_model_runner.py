@@ -6681,6 +6681,16 @@ class GPUModelRunner(
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 
+        # Reserve every per-ubatch workspace slot at the largest size seen
+        # during warmup before locking. Warmup only sizes slot 0 (non-ubatch
+        # profile) at full size and the decode ubatch slots at the small decode
+        # size, so without this the first runtime prefill ubatch would try to
+        # grow a decode-sized slot while locked and crash (workspace.py:157).
+        if self.parallel_config.use_ubatching:
+            from vllm.v1.worker.workspace import equalize_ubatch_workspaces
+
+            equalize_ubatch_workspaces()
+
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()

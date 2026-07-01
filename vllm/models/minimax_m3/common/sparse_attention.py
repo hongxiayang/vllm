@@ -26,6 +26,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
 from vllm.platforms import current_platform
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled, dbo_yield
 
 # AMD/ROCm uses the gfx942/gfx950-optimized block-sparse kernels in amd.ops;
 # every other platform uses the generic common.ops implementation.
@@ -352,8 +353,10 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         nd = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
         # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
+        # Select this micro-batch's slot (0 when DBO is off) to match the write.
         topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
         assert topk is not None
+        topk = topk[dbo_current_ubatch_id()]
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
@@ -365,6 +368,14 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
+            if dbo_enabled() and d.decode_query_len > 1:
+                # Mirrors ATOM TBO #1373: the per-ubatch sparse-decode metadata
+                # split is only validated for single-query decode. Multi-query
+                # decode (MTP/spec) under DBO is not supported yet.
+                raise NotImplementedError(
+                    "MiniMax-M3 sparse DBO decode with decode_query_len > 1 "
+                    "(MTP/spec decode) is not supported yet."
+                )
             minimax_m3_sparse_attn_decode(
                 q[:nd],
                 kv_cache,
@@ -394,6 +405,13 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 self.scale,
                 out[nd:],
             )
+        # DBO hand-off point (mirrors ATOM TBO #1373): yield to the sibling
+        # micro-batch after the sparse attend so the two ubatch threads
+        # ping-pong the shared compute stream. Unconditional so both ubatches
+        # yield the same number of times regardless of their decode/prefill
+        # split (asymmetric yields would deadlock the ping-pong). No-op when
+        # DBO is off.
+        dbo_yield()
         return output
 
 
