@@ -60,7 +60,13 @@ logger = init_logger(__name__)
 
 
 def minimax_m3_use_aiter_sparse_pa(num_kv_heads: int) -> bool:
-    """Whether to use the ROCm AITER page-16 sparse PA prototype."""
+    """Whether to use the ROCm AITER page-16 sparse PA prototype.
+
+    Works with speculative decoding: the AITER sparse-PA decode path handles
+    ``decode_query_len > 1`` (spec-decode verify) by routing the verify tokens
+    through the per-token (prefill-style) gluon path, so it no longer needs to
+    fall back to the Triton sparse path under ``--speculative-config``.
+    """
     return bool(
         current_platform.is_rocm()
         and envs.VLLM_ROCM_USE_AITER
@@ -434,7 +440,8 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
             minimax_m3_sparse_attn_prefill_aiter,
         )
 
-        attn_metadata = get_forward_context().attn_metadata
+        fwd_ctx = get_forward_context()
+        attn_metadata = fwd_ctx.attn_metadata
         if not isinstance(attn_metadata, dict):
             return output
         main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
@@ -457,32 +464,85 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
         v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
 
+        # Cross-layer sparse-block-table reuse (ATOM index_topk_freq): the
+        # compacted 16-page block_table depends only on the shared top-k
+        # selection + block_table + seq_lens, which are identical across every
+        # layer that reuses one top-k group. The group's leading compute layer
+        # (skip_index_topk == False) rebuilds it into a per-step cache on the
+        # forward context; the trailing skip_index_topk layers reuse it instead
+        # of rebuilding the same table each layer.
+        skip_index_topk = bool(getattr(layer, "skip_index_topk", False))
+        cache = getattr(fwd_ctx, "_m3_sparse_bt_cache", None)
+        if cache is None:
+            cache = {}
+            fwd_ctx._m3_sparse_bt_cache = cache  # type: ignore[attr-defined]
+        reuse = skip_index_topk
+        d_bt = cache.get("decode") if reuse else None
+        p_bt = cache.get("prefill") if reuse else None
+
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
-            if d.decode_query_len != 1:
-                raise NotImplementedError(
-                    "MiniMax-M3 AITER sparse PA does not support speculative "
-                    f"decode_query_len={d.decode_query_len}"
+            dql = d.decode_query_len
+            if dql == 1:
+                bt, ctx = minimax_m3_sparse_attn_decode_aiter(
+                    q[:nd],
+                    k_cache,
+                    v_cache,
+                    topk[:, :nd, :],
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:nd],
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    sparse_bt=d_bt[0] if d_bt is not None else None,
+                    sparse_ctx=d_bt[1] if d_bt is not None else None,
                 )
-            minimax_m3_sparse_attn_decode_aiter(
-                q[:nd],
-                k_cache,
-                v_cache,
-                topk[:, :nd, :],
-                d.block_table,
-                d.seq_lens,
-                self.num_kv_heads,
-                self.scale,
-                out[:nd],
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+            else:
+                # Speculative-decode verify: each request contributes ``dql`` =
+                # (1 + num_speculative_tokens) query tokens. Route them through
+                # the per-token (prefill-style) aiter path, which gives each
+                # query token its own causal context window -- exactly what the
+                # verify step needs (query token i attends to context + verify
+                # tokens 0..i). The verify block is the last ``dql`` positions of
+                # each sequence, so prefix_len = seq_len - dql and the per-request
+                # query CSR is uniform stride ``dql``. Enables aiter sparse PA
+                # (fast SHUFFLE gluon attention) for spec decode instead of
+                # falling back to the slower Triton sparse path.
+                num_dec = d.seq_lens.shape[0]
+                cu_seqlens_q = torch.arange(
+                    0,
+                    (num_dec + 1) * dql,
+                    dql,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                prefix_lens = (d.seq_lens - dql).to(torch.int32)
+                bt, ctx = minimax_m3_sparse_attn_prefill_aiter(
+                    q[:nd],
+                    k_cache,
+                    v_cache,
+                    topk[:, :nd, :],
+                    d.block_table,
+                    cu_seqlens_q,
+                    prefix_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:nd],
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    sparse_bt=d_bt[0] if d_bt is not None else None,
+                    sparse_ctx=d_bt[1] if d_bt is not None else None,
+                )
+            if not skip_index_topk:
+                cache["decode"] = (bt, ctx)
 
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None
-            minimax_m3_sparse_attn_prefill_aiter(
+            bt, ctx = minimax_m3_sparse_attn_prefill_aiter(
                 q[nd:],
                 k_cache,
                 v_cache,
@@ -495,7 +555,11 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                 out[nd:],
                 k_scale=k_scale,
                 v_scale=v_scale,
+                sparse_bt=p_bt[0] if p_bt is not None else None,
+                sparse_ctx=p_bt[1] if p_bt is not None else None,
             )
+            if not skip_index_topk:
+                cache["prefill"] = (bt, ctx)
         return output
 
 
@@ -519,8 +583,8 @@ def select_main_impl_cls(
         and topk_blocks in (4, 8, 16, 32)
         and kv_cache_dtype != "fp8_e5m2"
     )
-    selected = "AITER_SPARSE_PA" if use_aiter_sparse_pa else (
-        "MSA" if use_msa else "Triton"
+    selected = (
+        "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")
     )
     logger.info_once(
         "MiniMax M3 sparse attention selected %s (kv_cache_dtype=%s, topk_blocks=%s)",
