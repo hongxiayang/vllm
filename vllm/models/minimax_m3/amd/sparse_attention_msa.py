@@ -55,24 +55,55 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
-            if d.decode_query_len != 1:
-                raise NotImplementedError(
-                    "MiniMax-M3 AITER sparse PA does not support speculative "
-                    f"decode_query_len={d.decode_query_len}"
+            dql = d.decode_query_len
+            if dql == 1:
+                minimax_m3_sparse_attn_decode_aiter(
+                    q[:nd],
+                    k_cache,
+                    v_cache,
+                    topk[:, :nd, :],
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:nd],
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
-            minimax_m3_sparse_attn_decode_aiter(
-                q[:nd],
-                k_cache,
-                v_cache,
-                topk[:, :nd, :],
-                d.block_table,
-                d.seq_lens,
-                self.num_kv_heads,
-                self.scale,
-                out[:nd],
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+            else:
+                # Speculative-decode verify: each request contributes ``dql`` =
+                # (1 + num_speculative_tokens) query tokens. Route them through
+                # the per-token (prefill-style) aiter path, which gives each
+                # query token its own causal context window -- exactly what the
+                # verify step needs (query token i attends to the context plus
+                # verify tokens 0..i). The verify block is the last ``dql``
+                # positions of each sequence, so prefix_len = seq_len - dql and
+                # the per-request query CSR is a uniform stride of ``dql``. This
+                # keeps spec decode on the fast SHUFFLE gluon path instead of
+                # falling back to the slower Triton sparse attend.
+                num_dec = d.seq_lens.shape[0]
+                cu_seqlens_q = torch.arange(
+                    0,
+                    (num_dec + 1) * dql,
+                    dql,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                prefix_lens = (d.seq_lens - dql).to(torch.int32)
+                minimax_m3_sparse_attn_prefill_aiter(
+                    q[:nd],
+                    k_cache,
+                    v_cache,
+                    topk[:, :nd, :],
+                    d.block_table,
+                    cu_seqlens_q,
+                    prefix_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:nd],
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
 
         if main_md.num_prefills > 0:
             p = main_md.prefill

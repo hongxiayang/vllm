@@ -64,7 +64,13 @@ def _minimax_m3_aiter_sparse_pa_requested() -> bool:
 
 
 def minimax_m3_use_aiter_sparse_pa(num_kv_heads: int) -> bool:
-    """Whether to use the ROCm AITER page-16 sparse PA prototype."""
+    """Whether to use the ROCm AITER page-16 sparse PA prototype.
+
+    Works with speculative decoding: the AITER sparse-PA decode path handles
+    ``decode_query_len > 1`` (spec-decode verify) by routing the verify tokens
+    through the per-token (prefill-style) gluon path, so it no longer falls
+    back to the Triton sparse path under ``--speculative-config``.
+    """
     requested = _minimax_m3_aiter_sparse_pa_requested()
     if requested and num_kv_heads != 1:
         raise ValueError(
