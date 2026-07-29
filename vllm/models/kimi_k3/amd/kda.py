@@ -8,11 +8,11 @@ Keeps the AMD kernel binding out of the shared layer
 from collections.abc import Callable
 
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
-    KimiGatedDeltaNetAttention,
+    KimiGatedDeltaNetAttentionBase,
 )
 
 
-class KimiGatedDeltaNetAttentionROCm(KimiGatedDeltaNetAttention):
+class KimiGatedDeltaNetAttention(KimiGatedDeltaNetAttentionBase):
     @staticmethod
     def _kda_kernels() -> tuple[Callable, Callable, Callable]:
         from vllm.models.kimi_k3.amd.ops.third_party.kda import (

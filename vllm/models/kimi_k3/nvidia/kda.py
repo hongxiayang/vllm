@@ -19,7 +19,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
-    KimiGatedDeltaNetAttention,
+    KimiGatedDeltaNetAttentionBase,
     _KimiGDNMergedColumnParallelLinear,
     a_log_weight_loader,
 )
@@ -699,7 +699,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
 
 
-class KimiGatedDeltaNetAttentionCUDA(KimiGatedDeltaNetAttention):
+class KimiGatedDeltaNetAttention(KimiGatedDeltaNetAttentionBase):
     @staticmethod
     def _kda_kernels() -> tuple[Callable, Callable, Callable]:
         from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (

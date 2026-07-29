@@ -88,7 +88,7 @@ from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.models.kimi_k3.nvidia.kda import (
-    KimiGatedDeltaNetAttentionCUDA,
+    KimiGatedDeltaNetAttention,
     KimiK3DeltaAttention,
 )
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
@@ -730,7 +730,7 @@ class KimiDecoderLayer(nn.Module):
                 )
                 self._self_attn_writes_output = False
             else:
-                self.self_attn = KimiGatedDeltaNetAttentionCUDA(
+                self.self_attn = KimiGatedDeltaNetAttention(
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",

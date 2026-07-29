@@ -153,18 +153,18 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
 
 
 @PluggableLayer.register("kimi_gated_delta_net_attention")
-class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+class KimiGatedDeltaNetAttentionBase(GatedDeltaNetAttention):
     @staticmethod
     def _kda_kernels() -> tuple[Callable, Callable, Callable]:
         """KDA kernels used by the forward pass.
 
         Vendor-neutral hook. Each vendor keeps its own kernel copies under
-        ``kimi_k3/{amd,nvidia}/ops`` and provides them by overriding this in a
-        vendor subclass (``KimiGatedDeltaNetAttentionROCm`` /
-        ``KimiGatedDeltaNetAttentionCUDA``), so this base has no vendor import.
+        ``kimi_k3/{amd,nvidia}/ops`` and provides them by overriding this in its
+        own ``KimiGatedDeltaNetAttention`` subclass (under ``kimi_k3/amd`` and
+        ``kimi_k3/nvidia``), so this base has no vendor import.
         """
         raise NotImplementedError(
-            "KimiGatedDeltaNetAttention subclasses must supply vendor KDA "
+            "KimiGatedDeltaNetAttentionBase subclasses must supply vendor KDA "
             "kernels by overriding _kda_kernels()."
         )
 
