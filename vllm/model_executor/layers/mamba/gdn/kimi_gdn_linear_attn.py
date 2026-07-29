@@ -20,7 +20,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import (
     FusedRMSNormGated,
 )
@@ -155,6 +154,20 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
 
 @PluggableLayer.register("kimi_gated_delta_net_attention")
 class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+    @staticmethod
+    def _kda_kernels() -> tuple[Callable, Callable, Callable]:
+        """KDA kernels used by the forward pass.
+
+        Vendor-neutral hook. Each vendor keeps its own kernel copies under
+        ``kimi_k3/{amd,nvidia}/ops`` and provides them by overriding this in a
+        vendor subclass (``KimiGatedDeltaNetAttentionROCm`` /
+        ``KimiGatedDeltaNetAttentionCUDA``), so this base has no vendor import.
+        """
+        raise NotImplementedError(
+            "KimiGatedDeltaNetAttention subclasses must supply vendor KDA "
+            "kernels by overriding _kda_kernels()."
+        )
+
     def get_state_dtype(
         self,
     ) -> tuple[torch.dtype, torch.dtype]:
@@ -393,20 +406,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata_raw is None:
             return
 
-        # Vendor-specific KDA kernels: AMD/ROCm and NVIDIA keep their own copies
-        # under kimi_k3/{amd,nvidia}/ops so each can diverge independently.
-        if current_platform.is_rocm():
-            from vllm.models.kimi_k3.amd.ops.third_party.kda import (
-                chunk_kda_with_fused_gate,
-                fused_recurrent_kda,
-                fused_recurrent_kda_packed_decode,
-            )
-        else:
-            from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
-                chunk_kda_with_fused_gate,
-                fused_recurrent_kda,
-                fused_recurrent_kda_packed_decode,
-            )
+        (
+            chunk_kda_with_fused_gate,
+            fused_recurrent_kda,
+            fused_recurrent_kda_packed_decode,
+        ) = self._kda_kernels()
 
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata_narrowed = attn_metadata_raw[self.prefix]

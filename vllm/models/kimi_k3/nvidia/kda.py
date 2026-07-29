@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+    KimiGatedDeltaNetAttention,
     _KimiGDNMergedColumnParallelLinear,
     a_log_weight_loader,
 )
@@ -696,3 +697,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+
+
+class KimiGatedDeltaNetAttentionCUDA(KimiGatedDeltaNetAttention):
+    @staticmethod
+    def _kda_kernels() -> tuple[Callable, Callable, Callable]:
+        from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+            chunk_kda_with_fused_gate,
+            fused_recurrent_kda,
+            fused_recurrent_kda_packed_decode,
+        )
+
+        return (
+            chunk_kda_with_fused_gate,
+            fused_recurrent_kda,
+            fused_recurrent_kda_packed_decode,
+        )

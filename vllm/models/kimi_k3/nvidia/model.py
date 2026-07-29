@@ -40,9 +40,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
-    KimiGatedDeltaNetAttention as KimiLinearGatedDeltaNetAttention,
-)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -90,7 +87,10 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
-from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
+from vllm.models.kimi_k3.nvidia.kda import (
+    KimiGatedDeltaNetAttentionCUDA,
+    KimiK3DeltaAttention,
+)
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
     enable_kimi_k3_low_latency_gemm,
 )
@@ -730,7 +730,7 @@ class KimiDecoderLayer(nn.Module):
                 )
                 self._self_attn_writes_output = False
             else:
-                self.self_attn = KimiLinearGatedDeltaNetAttention(
+                self.self_attn = KimiGatedDeltaNetAttentionCUDA(
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
